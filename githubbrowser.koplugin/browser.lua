@@ -465,6 +465,7 @@ function GithubBrowserUI.showSettings(on_close)
             local PathChooser = require("ui/widget/pathchooser")
             local path_chooser
             path_chooser = PathChooser:new {
+                path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or require("datastorage"):getDataDir(),
                 select_file = false,
                 select_directory = true,
                 onConfirm = function(path)
@@ -646,12 +647,17 @@ function GithubBrowserUI.showTokenManager(on_close)
         })
     end
     table.insert(items, {
-        text = _("\u{EA06} Import Tokens from File"),
+        text = _("\u{EA06} Import Tokens (File Picker)"),
         callback = function()
             GithubBrowserUI.promptImportTokens(on_close)
         end,
     })
-
+    table.insert(items, {
+        text = _("\u{EA06} Import Tokens (Type Path) - Use if picker fails"),
+        callback = function()
+            GithubBrowserUI.promptImportTokensPath(on_close)
+        end,
+    })
     UIManager:show(BrowserMenu:new {
         title = _("GitHub Tokens"),
         item_table = items,
@@ -723,6 +729,7 @@ function GithubBrowserUI.promptImportTokens(on_close)
     local FileChooser = require("ui/widget/filechooser")
     local file_chooser
     file_chooser = FileChooser:new {
+        path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or require("datastorage"):getDataDir(),
         title = _("Select Token File (.txt)"),
         onFileSelect = function(self_fc, item)
             UIManager:close(self_fc)
@@ -736,6 +743,36 @@ function GithubBrowserUI.promptImportTokens(on_close)
         end,
     }
     UIManager:show(file_chooser)
+end
+
+function GithubBrowserUI.promptImportTokensPath(on_close)
+    local InputDialog = require("ui/widget/inputdialog")
+    local default_path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or "/mnt/onboard"
+    default_path = default_path .. "/token.txt"
+    
+    local dlg
+    dlg = InputDialog:new {
+        title = _("Enter path to tokens file"),
+        input = default_path,
+        input_type = "string",
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function()
+                UIManager:close(dlg)
+                if on_close then on_close() end
+            end },
+            { text = _("Import"), is_enter = true, callback = function()
+                local text = dlg:getInputValue()
+                UIManager:close(dlg)
+                if text and text ~= "" then
+                    GithubBrowserUI.processTokenFile(text, on_close)
+                else
+                    if on_close then on_close() end
+                end
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
 end
 
 function GithubBrowserUI.processTokenFile(path, on_close)

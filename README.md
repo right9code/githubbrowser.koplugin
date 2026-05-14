@@ -35,7 +35,14 @@ Open the plugin from the KOReader top menu under **Search > Github Browser**:
 ### Token Management
 To access private repositories or perform write operations (edit, create, delete files):
 1. Go to **Settings > Manage GitHub Tokens**.
-2. Add a token manually, or import multiple tokens from a `.txt` file (one token per line).
+2. Add a token manually, or import multiple tokens from a `.txt` file.
+   - **File Format:** The text file must contain exactly **one token per line**:
+     ```text
+     github_pat_11ABCD...
+     github_pat_22EFGH...
+     ```
+   - **Tip:** Use **Import Tokens (File Picker)** to browse for your `.txt` file visually.
+   - **Fallback:** If the File Picker crashes on your device (common on some Kobo firmware), use **Import Tokens (Type Path)** and simply enter the path to the file (e.g. `/mnt/onboard/token.txt`).
 3. Set a default token, or assign specific tokens to individual repositories.
 
 > **How to get a GitHub token**: Visit [github.com/settings/tokens](https://github.com/settings/tokens) and create a Personal Access Token with `repo` scope.
