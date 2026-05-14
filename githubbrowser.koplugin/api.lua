@@ -51,48 +51,58 @@ end
 -- ── curl-based write helper ───────────────────────────────────────────────────
 
 local function curlRequest(url, method, payload, token)
-    logger.dbg("GithubBrowserAPI: curl " .. method .. " " .. url)
+    logger.dbg("GithubBrowserAPI: " .. method .. " " .. url)
 
-    local cache_dir = DataStorage:getDataDir() .. "/cache"
-    os.execute("mkdir -p " .. cache_dir)
-    local tmp_payload = cache_dir .. "/githubbrowser_payload.json"
+    local headers = {
+        ["User-Agent"] = "KOReader-GithubBrowser/1.0",
+        ["Accept"]     = "application/vnd.github.v3+json",
+        ["Content-Type"] = "application/json",
+    }
 
-    if payload then
-        local fh = io.open(tmp_payload, "w")
-        if fh then
-            fh:write(payload)
-            fh:close()
-        end
-    end
-
-    local cmd = string.format(
-        'curl -s -S -X %s -H "User-Agent: KOReader-GithubBrowser/1.0" -H "Accept: application/vnd.github.v3+json" -H "Content-Type: application/json" --connect-timeout 30 --max-time 120',
-        method
-    )
     if token and token ~= "" then
-        cmd = cmd .. string.format(' -H "Authorization: token %s"', token)
+        headers["Authorization"] = "token " .. token
     end
+
+    local source = nil
     if payload then
-        cmd = cmd .. string.format(' -d @"%s"', tmp_payload)
-    end
-    cmd = cmd .. string.format(' "%s"', url)
-
-    local handle = io.popen(cmd .. " 2>&1")
-    local response = ""
-    if handle then
-        response = handle:read("*a")
-        handle:close()
+        headers["Content-Length"] = tostring(#payload)
+        source = ltn12.source.string(payload)
+    else
+        headers["Content-Length"] = "0"
     end
 
-    if payload then os.remove(tmp_payload) end
+    local response_body = {}
 
-    if response == "" then
-        return nil, "Empty response from GitHub API."
-    end
+    socketutil:set_timeout(DEFAULT_TIMEOUT, DEFAULT_MAXTIME)
+    local ok, code, _resp_headers, _status = socket_http.request {
+        url      = url,
+        method   = method,
+        headers  = headers,
+        source   = source,
+        sink     = ltn12.sink.table(response_body),
+        redirect = true,
+    }
+    socketutil:reset_timeout()
 
-    local ok, data = pcall(json.decode, response)
     if not ok then
-        return nil, "Failed to parse response: " .. response:sub(1, 200)
+        return nil, "Network error: " .. tostring(code)
+    end
+
+    local response = table.concat(response_body)
+
+    if response == "" and (code == 200 or code == 201 or code == 204) then
+        return { success = true }, nil
+    elseif response == "" then
+        return nil, "Empty response (HTTP " .. tostring(code) .. ")"
+    end
+
+    local ok2, data = pcall(json.decode, response)
+    if not ok2 then
+        return nil, "Failed to parse response (HTTP " .. tostring(code) .. "): " .. response:sub(1, 200)
+    end
+
+    if type(code) == "number" and code >= 400 then
+        return nil, "API Error (HTTP " .. tostring(code) .. "): " .. (data.message or "?")
     end
 
     return data, nil
