@@ -1636,8 +1636,10 @@ function GithubBrowserUI.searchRepoCode(owner, repo, branch, query, on_close)
             local snippet = ""
             if item.text_matches and #item.text_matches > 0 then
                 snippet = item.text_matches[1].fragment or ""
-                snippet = snippet:gsub("[\r\n\t]+", " ")
-                if #snippet > 80 then snippet = snippet:sub(1, 80) .. "..." end
+                -- Replace all control characters (newlines, tabs, etc) with a space
+                snippet = snippet:gsub("%c", " ")
+                -- Truncate heavily to prevent TextWidget layout crashes on smaller e-ink screens
+                if #snippet > 40 then snippet = snippet:sub(1, 40) .. "..." end
             end
             table.insert(results, {
                 path = item.path,
