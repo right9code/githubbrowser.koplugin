@@ -81,5 +81,5 @@ githubbrowser.koplugin/
 
 ---
 **Author**: right9code  
-**Version**: 0.1  
+**Version**: 1.0  
 **License**: [Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](https://creativecommons.org/licenses/by-nc/4.0/)
