@@ -1084,6 +1084,22 @@ function GithubBrowserUI.openRepo(owner, repo, path, branch, on_close)
                 GithubBrowserUI.showTokenSelectMenu(owner, repo, on_close)
             end,
         })
+
+        table.insert(items, {
+            text = _("\u{F414} Search files/folder"),
+            callback = function(menu)
+                UIManager:close(menu)
+                GithubBrowserUI.promptSearchRepo(owner, repo, branch, "filename", on_close)
+            end,
+        })
+        
+        table.insert(items, {
+            text = _("\u{E91D} Search code"),
+            callback = function(menu)
+                UIManager:close(menu)
+                GithubBrowserUI.promptSearchRepo(owner, repo, branch, "code", on_close)
+            end,
+        })
     else
         local parent_path = path:match("^(.+)/[^/]+$") or ""
         table.insert(items, {
@@ -1535,6 +1551,151 @@ function GithubBrowserUI._doCommit(owner, repo, file_path, content, sha, branch,
     UIManager:scheduleIn(1, function()
         GithubBrowserUI.openRepo(owner, repo, parent_path, branch)
     end)
+end
+
+function GithubBrowserUI.promptSearchRepo(owner, repo, branch, search_type, on_close)
+    local InputDialog = require("ui/widget/inputdialog")
+    local title = search_type == "filename" and _("Search files/folder in repo") or _("Search code in repo")
+    
+    local dlg
+    dlg = InputDialog:new {
+        title = title,
+        input = "",
+        input_type = "string",
+        buttons = {{
+            { text = _("Cancel"), id = "close", callback = function()
+                UIManager:close(dlg)
+                GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
+            end },
+            { text = _("Search"), is_enter = true, callback = function()
+                local query = dlg:getInputValue()
+                UIManager:close(dlg)
+                if query and query ~= "" then
+                    if search_type == "filename" then
+                        GithubBrowserUI.searchRepoFilenames(owner, repo, branch, query, on_close)
+                    else
+                        GithubBrowserUI.searchRepoCode(owner, repo, branch, query, on_close)
+                    end
+                else
+                    GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
+                end
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+function GithubBrowserUI.searchRepoFilenames(owner, repo, branch, query, on_close)
+    local loading = InfoMessage:new { text = _("Fetching repository tree..."), timeout = 0 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+
+    local tree_data, err = GithubBrowserAPI.getTree(owner, repo, branch)
+    UIManager:close(loading)
+
+    if not tree_data or not tree_data.tree then
+        UIManager:show(InfoMessage:new { text = _("Search failed: ") .. (err or "?"), timeout = 4 })
+        GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
+        return
+    end
+
+    local query_lower = query:lower()
+    local results = {}
+    for _, item in ipairs(tree_data.tree) do
+        if item.type == "blob" and item.path:lower():find(query_lower, 1, true) then
+            table.insert(results, item)
+            if #results >= 100 then break end
+        end
+    end
+
+    GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, "filename")
+end
+
+function GithubBrowserUI.searchRepoCode(owner, repo, branch, query, on_close)
+    local loading = InfoMessage:new { text = _("Searching code..."), timeout = 0 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+
+    local data, err = GithubBrowserAPI.searchCode(owner, repo, query)
+    UIManager:close(loading)
+
+    if not data then
+        local msg = err or "?"
+        if msg:find("HTTP 401") or msg:find("HTTP 403") or msg:find("Requires authentication") then
+            msg = _("Rate limit exceeded or token required.\nPlease add a GitHub Token in settings.")
+        end
+        UIManager:show(InfoMessage:new { text = _("Search failed: ") .. msg, timeout = 5 })
+        GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
+        return
+    end
+
+    local results = {}
+    if data.items then
+        for _, item in ipairs(data.items) do
+            local snippet = ""
+            if item.text_matches and #item.text_matches > 0 then
+                snippet = item.text_matches[1].fragment or ""
+                snippet = snippet:gsub("[\r\n\t]+", " ")
+                if #snippet > 80 then snippet = snippet:sub(1, 80) .. "..." end
+            end
+            table.insert(results, {
+                path = item.path,
+                type = "blob",
+                snippet = snippet,
+                url = item.html_url
+            })
+        end
+    end
+
+    GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, "code")
+end
+
+function GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, search_type)
+    local items = {}
+    
+    table.insert(items, {
+        text = "\u{ED0B} Back to repo root",
+        callback = function(menu)
+            UIManager:close(menu)
+            GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
+        end,
+    })
+
+    if #results == 0 then
+        table.insert(items, { text = _("No matching files found."), unselectable = true })
+    else
+        table.sort(results, function(a, b) return a.path:lower() < b.path:lower() end)
+        for _, item in ipairs(results) do
+            local file_name = item.path:match("([^/]+)$") or item.path
+            local dir_path = item.path:match("^(.*)/[^/]+$") or ""
+            local size_str = item.size and GithubBrowserAPI.formatSize(item.size) or ""
+            
+            local mandatory_str = size_str ~= "" and size_str or dir_path
+            if item.snippet and item.snippet ~= "" then
+                mandatory_str = item.snippet
+            end
+            
+            local icon = search_type == "code" and "\u{E91D} " or "\u{F414} "
+            
+            table.insert(items, {
+                text = icon .. file_name,
+                mandatory = mandatory_str,
+                callback = function(menu)
+                    UIManager:close(menu)
+                    GithubBrowserUI.openRepo(owner, repo, item.path, branch, function()
+                        GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, search_type)
+                    end)
+                end,
+            })
+        end
+    end
+
+    UIManager:show(BrowserMenu:new {
+        title = string.format(_("Search Results: '%s' (%d)"), query, #results),
+        item_table = items,
+        on_close = on_close,
+    })
 end
 
 return GithubBrowserUI
