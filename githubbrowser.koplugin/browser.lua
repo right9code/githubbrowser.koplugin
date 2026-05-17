@@ -208,7 +208,7 @@ end
 
 function GithubBrowserUI.showAbout(on_close)
     local about_text =
-        _("Version: 0.1\n") ..
+        _("Version: 1.0\n") ..
         _("Author: right9code\n\n") ..
         _("A comprehensive GitHub client tailored for KOReader.\n\n") ..
         _("Key Features:\n") ..
