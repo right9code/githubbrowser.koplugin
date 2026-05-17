@@ -118,12 +118,12 @@ local function extractRepoFromURL(url)
     return nil
 end
 
-local function makeRequest(url)
+local function makeRequest(url, custom_accept)
     logger.dbg("GithubBrowserAPI: GET " .. url)
 
     local headers = {
         ["User-Agent"] = "KOReader-GithubBrowser/1.0",
-        ["Accept"]     = "application/vnd.github.v3+json",
+        ["Accept"]     = custom_accept or "application/vnd.github.v3+json",
     }
 
     local repo_full = extractRepoFromURL(url)
@@ -243,6 +243,20 @@ function GithubBrowserAPI.getContents(owner, repo, path, ref)
         url = url .. "?ref=" .. urlEncodeQuery(ref)
     end
     return makeRequest(url)
+end
+
+--- Fetch repository Git Tree recursively.
+function GithubBrowserAPI.getTree(owner, repo, ref)
+    ref = ref or "main"
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/git/trees/" .. urlEncodePath(ref) .. "?recursive=1"
+    return makeRequest(url)
+end
+
+--- Search code within a repository.
+function GithubBrowserAPI.searchCode(owner, repo, query)
+    local full_query = query .. " repo:" .. owner .. "/" .. repo
+    local url = BASE_URL .. "/search/code?q=" .. urlEncodeQuery(full_query) .. "&per_page=50"
+    return makeRequest(url, "application/vnd.github.v3.text-match+json")
 end
 
 --- Download a raw file URL and return its text content.
