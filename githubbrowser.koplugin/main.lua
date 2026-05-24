@@ -52,7 +52,7 @@ end
 
 function GithubBrowser:_launch()
     -- Lazy-load the browser module to keep KOReader startup fast
-    local ok, browser_or_err = pcall(require, "browser")
+    local ok, browser_or_err = pcall(require, "githubbrowser_browser")
     if not ok then
         UIManager:show(InfoMessage:new {
             text    = _("Github Browser failed to load:\n") .. tostring(browser_or_err),

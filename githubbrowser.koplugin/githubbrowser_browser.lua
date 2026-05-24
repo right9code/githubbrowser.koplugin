@@ -16,8 +16,8 @@ local lfs          = require("libs/libkoreader-lfs")
 local logger       = require("logger")
 local _            = require("gettext")
 
-local GithubBrowserAPI      = require("api")
-local GithubBrowserSettings = require("settings")
+local GithubBrowserAPI      = require("githubbrowser_api")
+local GithubBrowserSettings = require("githubbrowser_settings")
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 

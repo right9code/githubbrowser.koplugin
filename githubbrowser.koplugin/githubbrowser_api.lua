@@ -12,7 +12,7 @@ local logger      = require("logger")
 local DataStorage = require("datastorage")
 local bit         = require("bit")
 
-local GithubBrowserSettings = require("settings")
+local GithubBrowserSettings = require("githubbrowser_settings")
 
 local GithubBrowserAPI = {}
 
