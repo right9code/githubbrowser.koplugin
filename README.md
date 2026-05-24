@@ -72,14 +72,14 @@ You can assign a gesture to open Github Browser directly:
 ## 📁 File Structure
 ```
 githubbrowser.koplugin/
-├── _meta.lua      # Plugin metadata (name, version, author)
-├── main.lua       # Entry point, menu & gesture registration
-├── api.lua        # GitHub REST API client
-├── browser.lua    # Full UI (home, bookmarks, history, settings, repo browser)
-└── settings.lua   # Persistent settings management
+├── _meta.lua                  # Plugin metadata (name, version, author)
+├── main.lua                   # Entry point, menu & gesture registration
+├── githubbrowser_api.lua      # GitHub REST API client (namespaced to avoid conflicts)
+├── githubbrowser_browser.lua  # Full UI (home, bookmarks, history, settings, repo browser)
+└── githubbrowser_settings.lua # Persistent settings management (namespaced to avoid conflicts)
 ```
 
 ---
 **Author**: right9code  
-**Version**: 1.0  
+**Version**: 1.0.1  
 **License**: [Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](https://creativecommons.org/licenses/by-nc/4.0/)
