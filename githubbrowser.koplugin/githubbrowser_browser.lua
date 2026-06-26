@@ -1,29 +1,25 @@
---[[--
-Main browsing UI for the Github Browser plugin.
-Features: enter repo, browse directories, view text files, download files.
-No README auto-popup. No token/auth features.
---]]--
-
 local Menu         = require("ui/widget/menu")
+local Font         = require("ui/font")
 local InputDialog  = require("ui/widget/inputdialog")
 local TextViewer   = require("ui/widget/textviewer")
 local InfoMessage  = require("ui/widget/infomessage")
 local ConfirmBox   = require("ui/widget/confirmbox")
 local ButtonDialog = require("ui/widget/buttondialog")
 local UIManager    = require("ui/uimanager")
+local NetworkMgr   = require("ui/network/manager")
 local Screen       = require("device").screen
 local lfs          = require("libs/libkoreader-lfs")
 local logger       = require("logger")
 local _            = require("gettext")
 
-local GithubBrowserAPI      = require("githubbrowser_api")
-local GithubBrowserSettings = require("githubbrowser_settings")
+local GitNotesAPI      = require("githubbrowser_api")
+local GitNotesSettings = require("githubbrowser_settings")
+local GitOps           = require("githubbrowser_git")
+local SyncEngine       = require("githubbrowser_sync")
+local IgnoreEngine     = require("githubbrowser_ignore")
+local Editor           = require("githubbrowser_editor")
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
-
-local function ensureDir(p)
-    if not lfs.attributes(p, "mode") then lfs.mkdir(p) end
-end
 
 local OPENABLE_EXT = {
     epub=true, pdf=true, djvu=true, cbz=true, cbr=true, fb2=true,
@@ -45,34 +41,33 @@ local function getExt(name)
     return (name:match("%.([^%.]+)$") or ""):lower()
 end
 
-local function isOpenable(name) return OPENABLE_EXT[getExt(name)] end
-
 local function isTextFile(name)
     local ext = getExt(name)
-    -- Files with known text extensions, or files with no extension at all
     return TEXT_EXT[ext] or ext == ""
+end
+
+local function ensureDir(p)
+    if not lfs.attributes(p, "mode") then lfs.mkdir(p) end
+end
+
+local function loadOrShow(path)
+    return lfs.attributes(path, "mode") ~= nil
 end
 
 -- ── Menu subclass ─────────────────────────────────────────────────────────────
 
-local BrowserMenu = Menu:extend {
+local BrowserMenu = Menu:extend{
     covers_fullscreen = true,
     is_borderless     = true,
     is_popout         = false,
 }
 
 function BrowserMenu:onMenuSelect(item)
-    if item.callback then 
-        item.callback(self) 
-        return true
-    end
+    if item.callback then item.callback(self); return true end
 end
 
 function BrowserMenu:onMenuHold(item)
-    if item.hold_callback then 
-        item.hold_callback(self) 
-        return true
-    end
+    if item.hold_callback then item.hold_callback(self); return true end
 end
 
 function BrowserMenu:onReturn()
@@ -81,38 +76,30 @@ function BrowserMenu:onReturn()
     return true
 end
 
--- ── GithubBrowserUI ────────────────────────────────────────────────────────────
+-- ── BrowserUI ─────────────────────────────────────────────────────────────────
 
-local GithubBrowserUI = {}
+local BrowserUI = {}
 
 -- ── Home Screen ───────────────────────────────────────────────────────────────
 
-function GithubBrowserUI.showHome()
+function BrowserUI.showHome()
     local function refresh_home()
-        if GithubBrowserUI._home_menu then UIManager:close(GithubBrowserUI._home_menu) end
-        GithubBrowserUI.showHome()
+        if BrowserUI._home_menu then UIManager:close(BrowserUI._home_menu) end
+        BrowserUI.showHome()
     end
 
-    local recent = GithubBrowserSettings.getRecentRepos()
+    local recent = GitNotesSettings.getRecentRepos()
     local items  = {}
 
-    -- Browse public repo
     table.insert(items, {
         text = _("\u{E647} Browse public repo..."),
-        callback = function()
-            GithubBrowserUI.showRepoInputDialog(refresh_home)
-        end,
+        callback = function() BrowserUI.showRepoInputDialog(refresh_home, false) end,
     })
-
-    -- Browse private repo
     table.insert(items, {
         text = _("\u{E636} Browse private repo..."),
-        callback = function()
-            GithubBrowserUI.showRepoInputDialog(refresh_home, true)
-        end,
+        callback = function() BrowserUI.showRepoInputDialog(refresh_home, true) end,
     })
 
-    -- Most recent repo (quick access)
     if #recent > 0 then
         local last = recent[1]
         table.insert(items, {
@@ -120,41 +107,52 @@ function GithubBrowserUI.showHome()
             mandatory = _("recent"),
             callback = function()
                 local owner, repo = last:match("^([^/]+)/(.+)$")
-                if owner then
-                    GithubBrowserUI.openRepo(owner, repo, nil, nil, refresh_home)
-                end
+                if owner then BrowserUI.openRepo(owner, repo, nil, nil, refresh_home) end
             end,
         })
     end
 
-    -- Pinned Repos
-    local pinned = GithubBrowserSettings.getPinnedRepos()
+    -- Local repos
+    local attached = GitNotesSettings.getAttachedRepos()
+    if #attached > 0 then
+        table.insert(items, {
+            text = "── " .. _("Local Repos") .. " ──",
+            callback = function() end,
+        })
+        for _, info in ipairs(attached) do
+            table.insert(items, {
+                text = "\u{E94A} " .. info.full_name,
+                mandatory = info.branch or "",
+                callback = function()
+                    local owner, repo = info.full_name:match("^([^/]+)/(.+)$")
+                    if owner then BrowserUI.openRepo(owner, repo, nil, nil, refresh_home) end
+                end,
+            })
+        end
+    end
+
+    -- Pinned
+    local pinned = GitNotesSettings.getPinnedRepos()
     if #pinned > 0 then
         table.insert(items, {
             text = "── " .. _("Pinned") .. " ──",
             callback = function() end,
         })
-        for i, full_name in ipairs(pinned) do
+        for _, full_name in ipairs(pinned) do
             table.insert(items, {
-                text = "  \u{EB02} " .. full_name,
+                text = "\u{EB02} " .. full_name,
                 callback = function()
                     local owner, repo = full_name:match("^([^/]+)/(.+)$")
-                    if owner then
-                        GithubBrowserUI.openRepo(owner, repo, nil, nil, refresh_home)
-                    end
+                    if owner then BrowserUI.openRepo(owner, repo, nil, nil, refresh_home) end
                 end,
-                hold_callback = function(menu)
-                    UIManager:show(ConfirmBox:new {
+                hold_callback = function()
+                    UIManager:show(ConfirmBox:new{
                         text = string.format(_("Unpin \"%s\"?"), full_name),
                         ok_text = _("Unpin"),
-                        cancel_text = _("Cancel"),
                         ok_callback = function()
-                            GithubBrowserSettings.removePinnedRepo(full_name)
-                            UIManager:show(InfoMessage:new {
-                                text = _("Unpinned."), timeout = 2,
-                            })
-                            UIManager:close(menu)
-                            GithubBrowserUI.showHome()
+                            GitNotesSettings.removePinnedRepo(full_name)
+                            UIManager:show(InfoMessage:new{ text = _("Unpinned."), timeout = 2 })
+                            BrowserUI.showHome()
                         end,
                     })
                 end,
@@ -162,430 +160,397 @@ function GithubBrowserUI.showHome()
         end
     end
 
-    -- Bookmarks
     table.insert(items, {
         text = _("\u{EBCD} Bookmarks"),
-        mandatory = tostring(#GithubBrowserSettings.getSavedRepos()),
-        callback = function()
-            GithubBrowserUI.showBookmarks(refresh_home)
-        end,
+        mandatory = tostring(#GitNotesSettings.getSavedRepos()),
+        callback = function() BrowserUI.showBookmarks(refresh_home) end,
     })
-
-    -- History
     table.insert(items, {
         text = _("\u{F017} History"),
         mandatory = tostring(#recent),
-        callback = function()
-            GithubBrowserUI.showHistory(refresh_home)
-        end,
+        callback = function() BrowserUI.showHistory(refresh_home) end,
     })
-
-    -- Settings
     table.insert(items, {
         text = _("\u{E615} Settings"),
-        callback = function()
-            GithubBrowserUI.showSettings(refresh_home)
-        end,
+        callback = function() BrowserUI.showSettings(refresh_home) end,
     })
-
-    -- About
     table.insert(items, {
         text = _("\u{E9FB} About"),
-        callback = function()
-            GithubBrowserUI.showAbout(refresh_home)
-        end,
+        callback = function() BrowserUI.showAbout() end,
     })
 
-    local menu = BrowserMenu:new {
-        title      = _("Github Browser"),
-        item_table = items,
-    }
-    GithubBrowserUI._home_menu = menu
+    local menu = BrowserMenu:new{ title = _("GitNotes"), item_table = items }
+    BrowserUI._home_menu = menu
     UIManager:show(menu)
 end
 
--- ── About Section ─────────────────────────────────────────────────────────────
+-- ── About ─────────────────────────────────────────────────────────────────────
 
-function GithubBrowserUI.showAbout(on_close)
-    local about_text =
-        _("Version: 1.0\n") ..
-        _("Author: right9code\n\n") ..
-        _("A comprehensive GitHub client tailored for KOReader.\n\n") ..
-        _("Key Features:\n") ..
-        _("• Browse public and private repositories seamlessly.\n") ..
-        _("• View, edit, and download files directly to your device.\n") ..
-        _("• Securely manage multiple GitHub personal access tokens.\n") ..
-        _("• Bookmark and pin your favorite repos for quick access.\n\n") ..
-        _("GitHub:\nhttps://github.com/right9code/githubbrowser.koplugin")
-
-    UIManager:show(TextViewer:new {
-        title = _("About Github Browser"),
-        text = about_text,
+function BrowserUI.showAbout()
+    UIManager:show(TextViewer:new{
+        title = _("About GitNotes"),
+        text = _("Version: 1.0\n") ..
+            _("Author: right9code\n\n") ..
+            _("A combined Git client and Markdown editor for KOReader.\n\n") ..
+            _("Features:\n") ..
+            _("• Browse & edit GitHub repos (remote API or local clone)\n") ..
+            _("• Clone repos for offline editing\n") ..
+            _("• Pull, commit, push from your e-reader\n") ..
+            _("• Smart sync detects local vs remote changes\n") ..
+            _("• Enhanced Markdown editor with toolbar\n\n") ..
+            _("GitHub:\nhttps://github.com/right9code/githubbrowser"),
         height = math.floor(Screen:getHeight() * 0.6),
     })
 end
 
--- ── Bookmarks View ────────────────────────────────────────────────────────────
+-- ── Bookmarks ─────────────────────────────────────────────────────────────────
 
-function GithubBrowserUI.showBookmarks(on_close)
-    local saved = GithubBrowserSettings.getSavedRepos()
+function BrowserUI.showBookmarks(on_close)
+    local saved = GitNotesSettings.getSavedRepos()
+    local items = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); if on_close then on_close() end end,
+    })
+    if #saved == 0 then
+        table.insert(items, { text = _("   No bookmarks yet."), callback = function() end })
+    else
+        for _, full_name in ipairs(saved) do
+            table.insert(items, {
+                text = "\u{EBCE} " .. full_name,
+                callback = function()
+                    local owner, repo = full_name:match("^([^/]+)/(.+)$")
+                    if owner then BrowserUI.openRepo(owner, repo, nil, nil, on_close) end
+                end,
+                hold_callback = function()
+                    UIManager:show(ConfirmBox:new{
+                        text = string.format(_("Remove \"%s\" from bookmarks?"), full_name),
+                        ok_text = _("Remove"),
+                        ok_callback = function()
+                            GitNotesSettings.removeSavedRepo(full_name)
+                            UIManager:show(InfoMessage:new{ text = _("Removed."), timeout = 2 })
+                            BrowserUI.showBookmarks(on_close)
+                        end,
+                    })
+                end,
+            })
+        end
+        table.insert(items, {
+            text = _("   Clear all bookmarks"),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = string.format(_("Remove all %d bookmarks?"), #saved),
+                    ok_text = _("Clear all"),
+                    ok_callback = function()
+                        GitNotesSettings.clearSavedRepos()
+                        UIManager:show(InfoMessage:new{ text = _("All bookmarks cleared."), timeout = 2 })
+                        BrowserUI.showBookmarks(on_close)
+                    end,
+                })
+            end,
+        })
+    end
+    UIManager:show(BrowserMenu:new{ title = _("Bookmarks"), item_table = items, on_close = on_close })
+end
+
+-- ── History ───────────────────────────────────────────────────────────────────
+
+function BrowserUI.showHistory(on_close)
+    local recent = GitNotesSettings.getRecentRepos()
+    local items  = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); if on_close then on_close() end end,
+    })
+    if #recent > 0 then
+        table.insert(items, {
+            text = _("   Clear history"),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = string.format(_("Clear all %d history entries?"), #recent),
+                    ok_text = _("Clear"),
+                    ok_callback = function()
+                        GitNotesSettings.clearRecentRepos()
+                        UIManager:show(InfoMessage:new{ text = _("History cleared."), timeout = 2 })
+                        BrowserUI.showHistory(on_close)
+                    end,
+                })
+            end,
+        })
+    end
+    if #recent == 0 then
+        table.insert(items, { text = _("   No history yet."), callback = function() end })
+    else
+        for _, full_name in ipairs(recent) do
+            local is_saved = GitNotesSettings.isSavedRepo(full_name)
+            table.insert(items, {
+                text = full_name,
+                mandatory = is_saved and "\u{EBCE}" or "",
+                callback = function()
+                    local owner, repo = full_name:match("^([^/]+)/(.+)$")
+                    if owner then BrowserUI.openRepo(owner, repo, nil, nil, on_close) end
+                end,
+                hold_callback = function()
+                    UIManager:show(ConfirmBox:new{
+                        text = string.format(_("Remove \"%s\" from history?"), full_name),
+                        ok_text = _("Remove"),
+                        ok_callback = function()
+                            GitNotesSettings.removeRecentRepo(full_name)
+                            UIManager:show(InfoMessage:new{ text = _("Removed."), timeout = 2 })
+                            BrowserUI.showHistory(on_close)
+                        end,
+                    })
+                end,
+            })
+        end
+    end
+    UIManager:show(BrowserMenu:new{ title = _("History"), item_table = items, on_close = on_close })
+end
+
+-- ── Settings ──────────────────────────────────────────────────────────────────
+
+function BrowserUI.showSettings(on_close)
+    local items = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); if on_close then on_close() end end,
+    })
+
+    table.insert(items, {
+        text = _("   Manage GitHub Tokens"),
+        callback = function() BrowserUI.showTokenManager(on_close) end,
+    })
+
+    local dl_dir = GitNotesSettings.getDownloadDir()
+    table.insert(items, {
+        text = _("   Download Folder"),
+        mandatory = dl_dir,
+        callback = function(menu)
+            local PathChooser = require("ui/widget/pathchooser")
+            local pc = PathChooser:new{
+                path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or "/",
+                select_file = false,
+                select_directory = true,
+                onConfirm = function(path)
+                    GitNotesSettings.setDownloadDir(path)
+                    UIManager:show(InfoMessage:new{ text = _("Download folder updated."), timeout = 2 })
+                    UIManager:close(menu)
+                    BrowserUI.showSettings(on_close)
+                end,
+            }
+            UIManager:show(pc)
+        end,
+    })
+
+    local workspace = GitNotesSettings.getWorkspace()
+    table.insert(items, {
+        text = _("   Git Workspace"),
+        mandatory = workspace,
+        callback = function(menu)
+            local PathChooser = require("ui/widget/pathchooser")
+            local pc = PathChooser:new{
+                path = workspace,
+                select_file = false,
+                select_directory = true,
+                onConfirm = function(path)
+                    GitNotesSettings.setWorkspace(path)
+                    ensureDir(path)
+                    UIManager:show(InfoMessage:new{ text = _("Workspace updated."), timeout = 2 })
+                    UIManager:close(menu)
+                    BrowserUI.showSettings(on_close)
+                end,
+            }
+            UIManager:show(pc)
+        end,
+    })
+
+    local device = GitNotesSettings.getDeviceName()
+    table.insert(items, {
+        text = _("   Device Name"),
+        mandatory = device,
+        callback = function(menu)
+            local dlg
+            dlg = InputDialog:new{
+                title = _("Device Name"),
+                input = device,
+                buttons = {{
+                    { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+                    { text = _("Save"), is_enter_default = true, callback = function()
+                        local val = dlg:getInputText():match("^%s*(.-)%s*$")
+                        if val == "" then val = "koreader" end
+                        GitNotesSettings.setDeviceName(val)
+                        UIManager:close(dlg)
+                        UIManager:show(InfoMessage:new{ text = _("Saved."), timeout = 2 })
+                        UIManager:close(menu)
+                        BrowserUI.showSettings(on_close)
+                    end },
+                }},
+            }
+            UIManager:show(dlg)
+            dlg:onShowKeyboard()
+        end,
+    })
+
+    table.insert(items, {
+        text = _("   Auto-sync on open"),
+        mandatory = GitNotesSettings.getAutoSyncOnOpen() and _("ON") or _("OFF"),
+        callback = function()
+            GitNotesSettings.setAutoSyncOnOpen(not GitNotesSettings.getAutoSyncOnOpen())
+            BrowserUI.showSettings(on_close)
+        end,
+    })
+
+    table.insert(items, {
+        text = _("   Ignore Patterns"),
+        callback = function() BrowserUI.showIgnoreSettings(on_close) end,
+    })
+
+    local quick_repo = GitNotesSettings.getQuickRepo()
+    table.insert(items, {
+        text = _("   Quick Repo (gesture shortcut)"),
+        mandatory = quick_repo ~= "" and quick_repo or _("Not set"),
+        callback = function(menu)
+            local dlg
+            dlg = InputDialog:new{
+                title = _("Quick Repo"),
+                input = quick_repo,
+                input_hint = _("owner/repo — opened by gesture shortcut"),
+                buttons = {{
+                    { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+                    { text = _("Clear"), callback = function()
+                        GitNotesSettings.setQuickRepo("")
+                        UIManager:close(dlg)
+                        UIManager:show(InfoMessage:new{ text = _("Quick repo cleared."), timeout = 2 })
+                        UIManager:close(menu)
+                        BrowserUI.showSettings(on_close)
+                    end },
+                    { text = _("Save"), is_enter_default = true, callback = function()
+                        local val = dlg:getInputText():match("^%s*(.-)%s*$")
+                        GitNotesSettings.setQuickRepo(val)
+                        UIManager:close(dlg)
+                        UIManager:show(InfoMessage:new{ text = _("Quick repo saved."), timeout = 2 })
+                        UIManager:close(menu)
+                        BrowserUI.showSettings(on_close)
+                    end },
+                }},
+            }
+            UIManager:show(dlg)
+            dlg:onShowKeyboard()
+        end,
+    })
+
+    UIManager:show(BrowserMenu:new{ title = _("Settings"), item_table = items, on_close = on_close })
+end
+
+function BrowserUI.editRemoteFileLocally(owner, repo, path, text, branch, sha)
+    local full_name = owner .. "/" .. repo
+    local local_path
+
+    -- If repo is attached, save into the local clone
+    if GitNotesSettings.isAttached(full_name) then
+        local repo_path = GitNotesSettings.getLocalPath(full_name)
+        local_path = repo_path .. "/" .. path
+        -- Ensure parent dirs exist
+        local parts = {}
+        for part in path:gmatch("[^/]+") do table.insert(parts, part) end
+        local dir = repo_path
+        for i = 1, #parts - 1 do
+            dir = dir .. "/" .. parts[i]
+            if not lfs.attributes(dir, "mode") then lfs.mkdir(dir) end
+        end
+    else
+        -- Save to download folder
+        local dl_dir = GitNotesSettings.getDownloadDir()
+        if not lfs.attributes(dl_dir, "mode") then lfs.mkdir(dl_dir) end
+        local filename = path:match("([^/]+)$") or path
+        local_path = dl_dir .. "/" .. filename
+    end
+
+    local f = io.open(local_path, "wb")
+    if not f then
+        UIManager:show(InfoMessage:new{ text = _("Cannot write file: ") .. local_path, timeout = 4 })
+        return
+    end
+    f:write(text)
+    f:close()
+
+    UIManager:show(InfoMessage:new{ text = _("Saved to: ") .. local_path, timeout = 2 })
+
+    -- Open in local editor with remote origin for direct commit
+    local remote_origin = {
+        owner  = owner,
+        repo   = repo,
+        path   = path,
+        branch = branch,
+        sha    = sha,
+    }
+    Editor.openFile(local_path, nil, remote_origin)
+end
+
+function BrowserUI.showIgnoreSettings(on_close)
+    local patterns = GitNotesSettings.getIgnorePatterns()
+    local items = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); BrowserUI.showSettings(on_close) end,
+    })
+    table.insert(items, {
+        text = _("\u{EA08} Add Pattern"),
+        callback = function()
+            local dlg
+            dlg = InputDialog:new{
+                title = _("Add Ignore Pattern"),
+                input = "",
+                input_hint = _("e.g. *.log, build, node_modules"),
+                buttons = {{
+                    { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+                    { text = _("Add"), is_enter_default = true, callback = function()
+                        local pat = dlg:getInputText():match("^%s*(.-)%s*$")
+                        if pat ~= "" then
+                            GitNotesSettings.addIgnorePattern(pat)
+                        end
+                        UIManager:close(dlg)
+                        BrowserUI.showIgnoreSettings(on_close)
+                    end },
+                }},
+            }
+            UIManager:show(dlg)
+            dlg:onShowKeyboard()
+        end,
+    })
+    for _, pat in ipairs(patterns) do
+        table.insert(items, {
+            text = "  " .. pat,
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = string.format(_("Remove \"%s\" from ignore list?"), pat),
+                    ok_text = _("Remove"),
+                    ok_callback = function()
+                        GitNotesSettings.removeIgnorePattern(pat)
+                        BrowserUI.showIgnoreSettings(on_close)
+                    end,
+                })
+            end,
+        })
+    end
+    UIManager:show(BrowserMenu:new{ title = _("Ignore Patterns"), item_table = items })
+end
+
+-- ── Token Manager ─────────────────────────────────────────────────────────────
+
+function BrowserUI.showTokenManager(on_close)
+    local tokens = GitNotesSettings.getTokens()
+    local default_name = GitNotesSettings.getDefaultTokenName()
     local items = {}
 
-    -- Back
     table.insert(items, {
         text = "\u{ED0B} Back",
         callback = function(menu)
             UIManager:close(menu)
-            if on_close then on_close() end
+            BrowserUI.showSettings(on_close)
         end,
     })
 
-    -- Clear all bookmarks will be at the bottom
-
-    if #saved == 0 then
-        table.insert(items, {
-            text = _("   No bookmarked repos yet."),
-            callback = function() end,
-        })
-    else
-        for i, full_name in ipairs(saved) do
-            table.insert(items, {
-                text = "  \u{EBCE} " .. full_name,
-                callback = function()
-                    local owner, repo = full_name:match("^([^/]+)/(.+)$")
-                    if owner then
-                        GithubBrowserUI.openRepo(owner, repo, nil, nil, on_close)
-                    end
-                end,
-                hold_callback = function(menu)
-                    UIManager:show(ConfirmBox:new {
-                        text = string.format(_("Remove \"%s\" from bookmarks?"), full_name),
-                        ok_text = _("Remove"),
-                        cancel_text = _("Cancel"),
-                        ok_callback = function()
-                            GithubBrowserSettings.removeSavedRepo(full_name)
-                            UIManager:show(InfoMessage:new {
-                                text = _("Removed."), timeout = 2,
-                            })
-                            UIManager:close(menu)
-                            GithubBrowserUI.showBookmarks(on_close)
-                        end,
-                    })
-                end,
-            })
-        end
-    end
-
-    -- Clear all bookmarks at the bottom
-    if #saved > 0 then
-        table.insert(items, {
-            text = _("   Clear all bookmarks"),
-            callback = function(menu)
-                UIManager:show(ConfirmBox:new {
-                    text = string.format(_("Remove all %d bookmarks?"), #saved),
-                    ok_text = _("Clear all"),
-                    cancel_text = _("Cancel"),
-                    ok_callback = function()
-                        GithubBrowserSettings.clearSavedRepos()
-                        UIManager:show(InfoMessage:new {
-                            text = _("All bookmarks cleared."), timeout = 2,
-                        })
-                        UIManager:close(menu)
-                        GithubBrowserUI.showBookmarks(on_close)
-                    end,
-                })
-            end,
-        })
-    end
-
-    UIManager:show(BrowserMenu:new {
-        title      = _("Bookmarks"),
-        item_table = items,
-        on_close   = on_close,
-    })
-end
-
--- ── History View ──────────────────────────────────────────────────────────────
-
-function GithubBrowserUI.showHistory(on_close)
-    local recent = GithubBrowserSettings.getRecentRepos()
-    local items  = {}
-
-    -- Back
-    table.insert(items, {
-        text = "◂ Back",
-        callback = function(menu)
-            UIManager:close(menu)
-            if on_close then on_close() end
-        end,
-    })
-
-    -- Clear history
-    if #recent > 0 then
-        table.insert(items, {
-            text = _("   Clear history"),
-            callback = function(menu)
-                UIManager:show(ConfirmBox:new {
-                    text = string.format(_("Clear all %d history entries?"), #recent),
-                    ok_text = _("Clear"),
-                    cancel_text = _("Cancel"),
-                    ok_callback = function()
-                        GithubBrowserSettings.clearRecentRepos()
-                        UIManager:show(InfoMessage:new {
-                            text = _("History cleared."), timeout = 2,
-                        })
-                        UIManager:close(menu)
-                        GithubBrowserUI.showHistory(on_close)
-                    end,
-                })
-            end,
-        })
-    end
-
-    if #recent == 0 then
-        table.insert(items, {
-            text = _("   No history yet."),
-            callback = function() end,
-        })
-    else
-        for i, full_name in ipairs(recent) do
-            local is_saved = GithubBrowserSettings.isSavedRepo(full_name)
-            table.insert(items, {
-                text = "  " .. full_name,
-                mandatory = is_saved and "\u{EBCE}" or "",
-                callback = function()
-                    local owner, repo = full_name:match("^([^/]+)/(.+)$")
-                    if owner then
-                        GithubBrowserUI.openRepo(owner, repo, nil, nil, on_close)
-                    end
-                end,
-                hold_callback = function(menu)
-                    UIManager:show(ConfirmBox:new {
-                        text = string.format(_("Remove \"%s\" from history?"), full_name),
-                        ok_text = _("Remove"),
-                        cancel_text = _("Cancel"),
-                        ok_callback = function()
-                            GithubBrowserSettings.removeRecentRepo(full_name)
-                            UIManager:show(InfoMessage:new {
-                                text = _("Removed."), timeout = 2,
-                            })
-                            UIManager:close(menu)
-                            GithubBrowserUI.showHistory(on_close)
-                        end,
-                    })
-                end,
-            })
-        end
-    end
-
-
-    UIManager:show(BrowserMenu:new {
-        title      = _("History"),
-        item_table = items,
-        on_close   = on_close,
-    })
-end
-
--- ── Settings View ─────────────────────────────────────────────────────────────
-
-function GithubBrowserUI.showSettings(on_close)
-    local items = {}
-
-    -- Back
-    table.insert(items, {
-        text = "◂ Back",
-        callback = function(menu)
-            UIManager:close(menu)
-            if on_close then on_close() end
-        end,
-    })
-
-    -- Clear history
-    local recent = GithubBrowserSettings.getRecentRepos()
-    if #recent > 0 then
-        table.insert(items, {
-            text = _("   Clear history"),
-            mandatory = tostring(#recent),
-            callback = function(menu)
-                UIManager:show(ConfirmBox:new {
-                    text = string.format(_("Clear all %d history entries?"), #recent),
-                    ok_text = _("Clear"),
-                    cancel_text = _("Cancel"),
-                    ok_callback = function()
-                        GithubBrowserSettings.clearRecentRepos()
-                        UIManager:show(InfoMessage:new {
-                            text = _("History cleared."), timeout = 2,
-                        })
-                        UIManager:close(menu)
-                        GithubBrowserUI.showSettings(on_close)
-                    end,
-                })
-            end,
-        })
-    end
-
-    -- Clear all bookmarks
-    local saved = GithubBrowserSettings.getSavedRepos()
-    if #saved > 0 then
-        table.insert(items, {
-            text = _("   Clear all bookmarks"),
-            mandatory = tostring(#saved),
-            callback = function(menu)
-                UIManager:show(ConfirmBox:new {
-                    text = string.format(_("Remove all %d bookmarks?"), #saved),
-                    ok_text = _("Clear all"),
-                    cancel_text = _("Cancel"),
-                    ok_callback = function()
-                        GithubBrowserSettings.clearSavedRepos()
-                        UIManager:show(InfoMessage:new {
-                            text = _("All bookmarks cleared."), timeout = 2,
-                        })
-                        UIManager:close(menu)
-                        GithubBrowserUI.showSettings(on_close)
-                    end,
-                })
-            end,
-        })
-    end
-
-    -- Manage GitHub Tokens
-    table.insert(items, {
-        text = _("   Manage GitHub Tokens"),
-        callback = function(menu)
-            GithubBrowserUI.showTokenManager(on_close)
-        end,
-    })
-
-    -- Download Folder
-    local current_dl_dir = GithubBrowserSettings.getDownloadDir()
-    table.insert(items, {
-        text = _("   Download Folder"),
-        mandatory = current_dl_dir,
-        callback = function(menu)
-            local PathChooser = require("ui/widget/pathchooser")
-            local path_chooser
-            path_chooser = PathChooser:new {
-                path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or require("datastorage"):getDataDir(),
-                select_file = false,
-                select_directory = true,
-                onConfirm = function(path)
-                    GithubBrowserSettings.setDownloadDir(path)
-                    UIManager:show(InfoMessage:new {
-                        text = _("Download folder updated."),
-                        timeout = 2,
-                    })
-                    UIManager:close(menu)
-                    GithubBrowserUI.showSettings(on_close)
-                end,
-            }
-            UIManager:show(path_chooser)
-        end,
-    })
-
-
-    -- Device Name
-    local current_device = GithubBrowserSettings.getDeviceName()
-    table.insert(items, {
-        text = _("   Device Name"),
-        mandatory = current_device,
-        callback = function(menu)
-            local dlg
-            dlg = InputDialog:new {
-                title = _("Device Name"),
-                input = current_device,
-                input_hint = _("e.g. koreader, libra2"),
-                buttons = {{
-                    {
-                        text = _("Cancel"),
-                        id = "close",
-                        callback = function() UIManager:close(dlg) end,
-                    },
-                    {
-                        text = _("Save"),
-                        is_enter_default = true,
-                        callback = function()
-                            local val = dlg:getInputText()
-                            UIManager:close(dlg)
-                            val = val:match("^%s*(.-)%s*$")
-                            if val == "" then val = "koreader" end
-                            GithubBrowserSettings.setDeviceName(val)
-                            UIManager:show(InfoMessage:new {
-                                text = _("Device name saved."),
-                                timeout = 2,
-                            })
-                            UIManager:close(menu)
-                            GithubBrowserUI.showSettings(on_close)
-                        end,
-                    },
-                }},
-            }
-            UIManager:show(dlg)
-            dlg:onShowKeyboard()
-        end,
-    })
-
-    -- Max history entries
-    local current_max = GithubBrowserSettings.getMaxRecentRepos()
-    table.insert(items, {
-        text = _("   Max history entries"),
-        mandatory = tostring(current_max),
-        callback = function(menu)
-            local dlg
-            dlg = InputDialog:new {
-                title = _("Max History Entries"),
-                input = tostring(current_max),
-                input_hint = _("Number (default: 20)"),
-                input_type = "number",
-                buttons = {{
-                    {
-                        text = _("Cancel"),
-                        id = "close",
-                        callback = function() UIManager:close(dlg) end,
-                    },
-                    {
-                        text = _("Save"),
-                        is_enter_default = true,
-                        callback = function()
-                            local val = tonumber(dlg:getInputText())
-                            UIManager:close(dlg)
-                            if not val or val < 1 then
-                                UIManager:show(InfoMessage:new {
-                                    text = _("Enter a number greater than 0."),
-                                    timeout = 3,
-                                })
-                                return
-                            end
-                            GithubBrowserSettings.setMaxRecentRepos(val)
-                            UIManager:show(InfoMessage:new {
-                                text = string.format(_("Max history set to %d."), val),
-                                timeout = 2,
-                            })
-                            UIManager:close(menu)
-                            GithubBrowserUI.showSettings(on_close)
-                        end,
-                    },
-                }},
-            }
-            UIManager:show(dlg)
-            dlg:onShowKeyboard()
-        end,
-    })
-
-    UIManager:show(BrowserMenu:new {
-        title      = _("Settings"),
-        item_table = items,
-        on_close   = on_close,
-    })
-end
-
--- ── Token Management Dialogs ──────────────────────────────────────────────────
-
-function GithubBrowserUI.showTokenManager(on_close)
-    local tokens = GithubBrowserSettings.getTokens()
-    local default_name = GithubBrowserSettings.getDefaultTokenName()
-    local items = {}
-
-    -- Count tokens to decide whether to show "Set Default"
     local token_count = 0
     for _ in pairs(tokens) do token_count = token_count + 1 end
 
@@ -593,18 +558,14 @@ function GithubBrowserUI.showTokenManager(on_close)
         table.insert(items, {
             text = _("\u{F43D} Set Default Token"),
             mandatory = default_name or _("Not set"),
-            callback = function()
-                GithubBrowserUI.showDefaultTokenPicker(on_close)
-            end,
+            callback = function() BrowserUI.showDefaultTokenPicker(on_close) end,
         })
     end
 
     table.insert(items, {
         text = _("\u{EA08} Add New Token"),
         callback = function()
-            GithubBrowserUI.promptForTokenString(nil, function()
-                GithubBrowserUI.showTokenManager(on_close)
-            end)
+            BrowserUI.promptForTokenString(nil, function() BrowserUI.showTokenManager(on_close) end)
         end,
     })
 
@@ -614,110 +575,104 @@ function GithubBrowserUI.showTokenManager(on_close)
             text = (is_default and "\u{EA05} " or "\u{EA0A} ") .. tname,
             mandatory = is_default and _("default") or "",
             callback = function()
-                UIManager:show(BrowserMenu:new {
+                UIManager:show(BrowserMenu:new{
                     title = _("Manage: ") .. tname,
                     item_table = {
                         {
-                            text = _("\u{EA07} Rename Token"),
+                            text = "\u{ED0B} Back",
                             callback = function(cmenu)
                                 UIManager:close(cmenu)
-                                GithubBrowserUI.promptRenameToken(tname, on_close)
+                                BrowserUI.showTokenManager(on_close)
                             end,
                         },
                         {
-                            text = _("\u{EA09} Delete Token"),
+                            text = _("\u{EA07} Rename"),
                             callback = function(cmenu)
                                 UIManager:close(cmenu)
-                                UIManager:show(ConfirmBox:new {
+                                BrowserUI.promptRenameToken(tname, on_close)
+                            end,
+                        },
+                        {
+                            text = _("\u{EA09} Delete"),
+                            callback = function(cmenu)
+                                UIManager:close(cmenu)
+                                UIManager:show(ConfirmBox:new{
                                     text = _("Delete token '") .. tname .. _("'?"),
-                                    ok_text = _("Delete"), cancel_text = _("Cancel"),
+                                    ok_text = _("Delete"),
                                     ok_callback = function()
-                                        GithubBrowserSettings.deleteToken(tname)
+                                        GitNotesSettings.deleteToken(tname)
                                         if tname == default_name then
-                                            GithubBrowserSettings.setDefaultTokenName(nil)
+                                            GitNotesSettings.setDefaultTokenName(nil)
                                         end
-                                        GithubBrowserUI.showTokenManager(on_close)
+                                        BrowserUI.showTokenManager(on_close)
                                     end,
                                 })
                             end,
-                        }
-                    }
+                        },
+                    },
                 })
             end,
         })
     end
+
     table.insert(items, {
-        text = _("\u{EA06} Import Tokens (File Picker)"),
-        callback = function()
-            GithubBrowserUI.promptImportTokens(on_close)
-        end,
+        text = _("\u{EA06} Import from file"),
+        callback = function() BrowserUI.promptImportTokens(on_close) end,
     })
-    table.insert(items, {
-        text = _("\u{EA06} Import Tokens (Type Path) - Use if picker fails"),
-        callback = function()
-            GithubBrowserUI.promptImportTokensPath(on_close)
-        end,
-    })
-    UIManager:show(BrowserMenu:new {
+
+    UIManager:show(BrowserMenu:new{
         title = _("GitHub Tokens"),
         item_table = items,
-        on_close = on_close and function() GithubBrowserUI.showSettings(on_close) end or nil,
+        on_close = on_close and function() BrowserUI.showSettings(on_close) end or nil,
     })
 end
 
-function GithubBrowserUI.showDefaultTokenPicker(on_close)
-    local tokens = GithubBrowserSettings.getTokens()
-    local current_default = GithubBrowserSettings.getDefaultTokenName()
+function BrowserUI.showDefaultTokenPicker(on_close)
+    local tokens = GitNotesSettings.getTokens()
+    local current = GitNotesSettings.getDefaultTokenName()
     local items = {}
-    
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu)
+            UIManager:close(menu)
+            BrowserUI.showTokenManager(on_close)
+        end,
+    })
     for tname, _v in pairs(tokens) do
-        local is_current = (tname == current_default)
         table.insert(items, {
-            text = (is_current and "● " or "○ ") .. tname,
-            mandatory = is_current and _("current") or "",
+            text = (tname == current and "● " or "○ ") .. tname,
+            mandatory = tname == current and _("current") or "",
             callback = function()
-                GithubBrowserSettings.setDefaultTokenName(tname)
-                UIManager:show(InfoMessage:new {
-                    text = _("Default token set to: ") .. tname,
-                    timeout = 2,
-                })
-                GithubBrowserUI.showTokenManager(on_close)
+                GitNotesSettings.setDefaultTokenName(tname)
+                UIManager:show(InfoMessage:new{ text = _("Default set to: ") .. tname, timeout = 2 })
+                BrowserUI.showTokenManager(on_close)
             end,
         })
     end
-    
     table.insert(items, {
         text = _("✕ Clear Default"),
         callback = function()
-            GithubBrowserSettings.setDefaultTokenName(nil)
-            UIManager:show(InfoMessage:new {
-                text = _("Default token cleared."),
-                timeout = 2,
-            })
-            GithubBrowserUI.showTokenManager(on_close)
+            GitNotesSettings.setDefaultTokenName(nil)
+            UIManager:show(InfoMessage:new{ text = _("Default cleared."), timeout = 2 })
+            BrowserUI.showTokenManager(on_close)
         end,
     })
-    
-    UIManager:show(BrowserMenu:new {
-        title = _("Set Default Token"),
-        item_table = items,
-    })
+    UIManager:show(BrowserMenu:new{ title = _("Set Default Token"), item_table = items })
 end
 
-function GithubBrowserUI.promptRenameToken(old_name, on_close)
+function BrowserUI.promptRenameToken(old_name, on_close)
     local dlg
-    dlg = InputDialog:new {
+    dlg = InputDialog:new{
         title = _("Rename Token"),
         input = old_name,
         buttons = {{
             { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
             { text = _("Save"), is_enter_default = true, callback = function()
-                local new_name = dlg:getInputText()
+                local new_name = dlg:getInputText():match("^%s*(.-)%s*$")
                 UIManager:close(dlg)
-                new_name = new_name:match("^%s*(.-)%s*$")
                 if new_name == "" or new_name == old_name then return end
-                GithubBrowserSettings.renameToken(old_name, new_name)
-                GithubBrowserUI.showTokenManager(on_close)
+                GitNotesSettings.renameToken(old_name, new_name)
+                BrowserUI.showTokenManager(on_close)
             end },
         }},
     }
@@ -725,15 +680,15 @@ function GithubBrowserUI.promptRenameToken(old_name, on_close)
     dlg:onShowKeyboard()
 end
 
-function GithubBrowserUI.promptImportTokens(on_close)
+function BrowserUI.promptImportTokens(on_close)
     local FileChooser = require("ui/widget/filechooser")
-    local file_chooser
-    file_chooser = FileChooser:new {
-        path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or require("datastorage"):getDataDir(),
+    local fc
+    fc = FileChooser:new{
+        path = G_reader_settings:readSetting("home_dir") or "/",
         title = _("Select Token File (.txt)"),
         onFileSelect = function(self_fc, item)
             UIManager:close(self_fc)
-            GithubBrowserUI.processTokenFile(item.path, on_close)
+            BrowserUI.processTokenFile(item.path, on_close)
             return true
         end,
         onClose = function(self_fc)
@@ -742,95 +697,55 @@ function GithubBrowserUI.promptImportTokens(on_close)
             return true
         end,
     }
-    UIManager:show(file_chooser)
+    UIManager:show(fc)
 end
 
-function GithubBrowserUI.promptImportTokensPath(on_close)
-    local InputDialog = require("ui/widget/inputdialog")
-    local default_path = G_reader_settings:readSetting("home_dir") or require("device").home_dir or "/mnt/onboard"
-    default_path = default_path .. "/token.txt"
-    
-    local dlg
-    dlg = InputDialog:new {
-        title = _("Enter path to tokens file"),
-        input = default_path,
-        input_type = "string",
-        buttons = {{
-            { text = _("Cancel"), id = "close", callback = function()
-                UIManager:close(dlg)
-                if on_close then on_close() end
-            end },
-            { text = _("Import"), is_enter = true, callback = function()
-                local text = dlg:getInputValue()
-                UIManager:close(dlg)
-                if text and text ~= "" then
-                    GithubBrowserUI.processTokenFile(text, on_close)
-                else
-                    if on_close then on_close() end
-                end
-            end },
-        }},
-    }
-    UIManager:show(dlg)
-    dlg:onShowKeyboard()
-end
-
-function GithubBrowserUI.processTokenFile(path, on_close)
+function BrowserUI.processTokenFile(path, on_close)
     local f = io.open(path, "r")
     if not f then
-        UIManager:show(InfoMessage:new { text = _("Could not open file:\n") .. path, timeout = 3 })
+        UIManager:show(InfoMessage:new{ text = _("Could not open file:\n") .. path, timeout = 3 })
         return
     end
-
     local tokens = {}
     for line in f:lines() do
-        local tstr = line:match("^%s*(.-)%s*$")
-        if tstr ~= "" then
-            table.insert(tokens, tstr)
-        end
+        local t = line:match("^%s*(.-)%s*$")
+        if t ~= "" then table.insert(tokens, t) end
     end
     f:close()
-
     if #tokens == 0 then
-        UIManager:show(InfoMessage:new { text = _("No tokens found in file."), timeout = 3 })
+        UIManager:show(InfoMessage:new{ text = _("No tokens found."), timeout = 3 })
         return
     end
-
-    GithubBrowserUI._promptNextImportToken(tokens, 1, on_close)
+    BrowserUI._promptNextImportToken(tokens, 1, on_close)
 end
 
-function GithubBrowserUI._promptNextImportToken(tokens, index, on_close)
+function BrowserUI._promptNextImportToken(tokens, index, on_close)
     if index > #tokens then
-        UIManager:show(InfoMessage:new { text = _("Import complete!"), timeout = 2 })
-        GithubBrowserUI.showTokenManager(on_close)
+        UIManager:show(InfoMessage:new{ text = _("Import complete!"), timeout = 2 })
+        BrowserUI.showTokenManager(on_close)
         return
     end
-
     local tstr = tokens[index]
-    local short_tstr = tstr:sub(1, 15) .. "..."
     local default_name = os.date("token_%Y%m%d%H%M") .. "_" .. index
-
     local dlg
-    dlg = InputDialog:new {
+    dlg = InputDialog:new{
         title = string.format(_("Name for token %d/%d"), index, #tokens),
-        description = _("Token: ") .. short_tstr,
+        description = _("Token: ") .. tstr:sub(1, 15) .. "...",
         input = default_name,
         buttons = {{
-            { text = _("Skip"), callback = function() 
+            { text = _("Skip"), callback = function()
                 UIManager:close(dlg)
                 UIManager:scheduleIn(0.1, function()
-                    GithubBrowserUI._promptNextImportToken(tokens, index + 1, on_close)
+                    BrowserUI._promptNextImportToken(tokens, index + 1, on_close)
                 end)
             end },
             { text = _("Save"), is_enter_default = true, callback = function()
-                local name = dlg:getInputText()
-                UIManager:close(dlg)
-                name = name:match("^%s*(.-)%s*$")
+                local name = dlg:getInputText():match("^%s*(.-)%s*$")
                 if name == "" then name = default_name end
-                
-                GithubBrowserSettings.addToken(name, tstr)
+                GitNotesSettings.addToken(name, tstr)
+                UIManager:close(dlg)
                 UIManager:scheduleIn(0.1, function()
-                    GithubBrowserUI._promptNextImportToken(tokens, index + 1, on_close)
+                    BrowserUI._promptNextImportToken(tokens, index + 1, on_close)
                 end)
             end },
         }},
@@ -839,52 +754,50 @@ function GithubBrowserUI._promptNextImportToken(tokens, index, on_close)
     dlg:onShowKeyboard()
 end
 
-function GithubBrowserUI.showTokenSelectMenu(owner, repo, on_close)
+function BrowserUI.showTokenSelectMenu(owner, repo, on_close)
     local full_name = owner .. "/" .. repo
-    local tokens = GithubBrowserSettings.getTokens()
-    
+    local tokens = GitNotesSettings.getTokens()
     local items = {}
     table.insert(items, {
-        text = _("➕ Add New Token"),
-        callback = function()
-            GithubBrowserUI.promptForTokenString(full_name, on_close)
-        end,
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); if on_close then on_close() end end,
     })
-    
+    table.insert(items, {
+        text = _("➕ Add New Token"),
+        callback = function() BrowserUI.promptForTokenString(full_name, on_close) end,
+    })
     for tname, _v in pairs(tokens) do
         table.insert(items, {
             text = "🔑 " .. tname,
             callback = function()
-                GithubBrowserSettings.setTokenForRepo(full_name, tname)
-                GithubBrowserUI.openRepo(owner, repo, nil, nil, on_close)
+                GitNotesSettings.setTokenForRepo(full_name, tname)
+                BrowserUI.openRepo(owner, repo, nil, nil, on_close)
             end,
         })
     end
-    
-    UIManager:show(BrowserMenu:new {
-        title = _("Select Token for: ") .. full_name,
+    UIManager:show(BrowserMenu:new{
+        title = _("Token for: ") .. full_name,
         item_table = items,
         on_close = on_close,
     })
 end
 
-function GithubBrowserUI.promptForTokenString(full_name, on_close)
+function BrowserUI.promptForTokenString(full_name, on_close)
     local dlg
-    dlg = InputDialog:new {
-        title = _("GitHub Token String"),
+    dlg = InputDialog:new{
+        title = _("GitHub Token"),
         input = "",
         input_hint = _("ghp_..."),
         buttons = {{
             { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
             { text = _("Next"), is_enter_default = true, callback = function()
-                local tstr = dlg:getInputText()
+                local tstr = dlg:getInputText():match("^%s*(.-)%s*$")
                 UIManager:close(dlg)
-                tstr = tstr:match("^%s*(.-)%s*$")
                 if tstr == "" then
-                    UIManager:show(InfoMessage:new { text = _("Token cannot be empty."), timeout = 2 })
+                    UIManager:show(InfoMessage:new{ text = _("Token cannot be empty."), timeout = 2 })
                     return
                 end
-                GithubBrowserUI.promptForTokenName(full_name, tstr, on_close)
+                BrowserUI.promptForTokenName(full_name, tstr, on_close)
             end },
         }},
     }
@@ -892,30 +805,26 @@ function GithubBrowserUI.promptForTokenString(full_name, on_close)
     dlg:onShowKeyboard()
 end
 
-function GithubBrowserUI.promptForTokenName(full_name, token_string, on_close)
+function BrowserUI.promptForTokenName(full_name, token_string, on_close)
     local dlg
-    dlg = InputDialog:new {
+    dlg = InputDialog:new{
         title = _("Token Name"),
         input = "",
-        input_hint = _("e.g. Work Token (Leave blank for timestamp)"),
+        input_hint = _("e.g. Work Token"),
         buttons = {{
             { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
             { text = _("Save"), is_enter_default = true, callback = function()
-                local tname = dlg:getInputText()
+                local tname = dlg:getInputText():match("^%s*(.-)%s*$")
+                if tname == "" then tname = os.date("token_%Y%m%d%H%M") end
+                GitNotesSettings.addToken(tname, token_string)
                 UIManager:close(dlg)
-                tname = tname:match("^%s*(.-)%s*$")
-                if tname == "" then
-                    tname = os.date("token_%Y%m%d%H%M")
-                end
-                GithubBrowserSettings.addToken(tname, token_string)
-                
                 if full_name then
-                    GithubBrowserSettings.setTokenForRepo(full_name, tname)
-                    UIManager:show(InfoMessage:new { text = _("Token saved and assigned!"), timeout = 2 })
+                    GitNotesSettings.setTokenForRepo(full_name, tname)
+                    UIManager:show(InfoMessage:new{ text = _("Token saved and assigned!"), timeout = 2 })
                     local owner, repo = full_name:match("^([^/]+)/(.+)$")
-                    GithubBrowserUI.openRepo(owner, repo, nil, nil, on_close)
+                    BrowserUI.openRepo(owner, repo, nil, nil, on_close)
                 else
-                    UIManager:show(InfoMessage:new { text = _("Token saved!"), timeout = 2 })
+                    UIManager:show(InfoMessage:new{ text = _("Token saved!"), timeout = 2 })
                     if on_close then on_close() end
                 end
             end },
@@ -927,92 +836,100 @@ end
 
 -- ── Repo Input Dialog ─────────────────────────────────────────────────────────
 
-function GithubBrowserUI.showRepoInputDialog(on_close, is_private)
+function BrowserUI.showRepoInputDialog(on_close, is_private)
     local dlg
-    dlg = InputDialog:new {
+    dlg = InputDialog:new{
         title = is_private and _("Open Private Repo") or _("Open Repository"),
         input = "",
         input_hint = _("owner/repo  or  github.com/owner/repo"),
         buttons = {{
-            {
-                text = _("Cancel"),
-                id = "close",
-                callback = function() UIManager:close(dlg) end,
-            },
-            {
-                text = _("Browse"),
-                is_enter_default = true,
-                callback = function()
-                    local inp = dlg:getInputText()
-                    UIManager:close(dlg)
-                    local owner, repo = GithubBrowserAPI.parseRepoInput(inp)
-                    if not owner then
-                        UIManager:show(InfoMessage:new {
-                            text = _("Invalid format.\nUse: owner/repo\n  or: https://github.com/owner/repo"),
-                            timeout = 4,
-                        })
-                        return
-                    end
-                    if is_private then
-                        GithubBrowserUI.showTokenSelectMenu(owner, repo, on_close)
-                    else
-                        GithubBrowserUI.openRepo(owner, repo, nil, nil, on_close)
-                    end
-                end,
-            },
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Browse"), is_enter_default = true, callback = function()
+                local inp = dlg:getInputText()
+                UIManager:close(dlg)
+                local owner, repo = GitNotesAPI.parseRepoInput(inp)
+                if not owner then
+                    UIManager:show(InfoMessage:new{
+                        text = _("Invalid format.\nUse: owner/repo"),
+                        timeout = 4,
+                    })
+                    return
+                end
+                if is_private then
+                    BrowserUI.showTokenSelectMenu(owner, repo, on_close)
+                else
+                    BrowserUI.openRepo(owner, repo, nil, nil, on_close)
+                end
+            end },
         }},
     }
     UIManager:show(dlg)
     dlg:onShowKeyboard()
 end
 
--- ── Open Repo / Browse Directory ──────────────────────────────────────────────
+-- ── Unified Repo Opener ───────────────────────────────────────────────────────
 
-function GithubBrowserUI.openRepo(owner, repo, path, branch, on_close)
+function BrowserUI.openRepo(owner, repo, path, branch, on_close)
     local full_name = owner .. "/" .. repo
+    local repo_info = GitNotesSettings.getRepoInfo(full_name)
 
-    -- If no branch yet, fetch repo metadata to get default branch
-    if not branch then
-        local loading = InfoMessage:new { text = _("Loading ..."), timeout = 30 }
-        UIManager:show(loading)
-        UIManager:forceRePaint()
-
-        local meta, err = GithubBrowserAPI.getRepo(owner, repo)
-        UIManager:close(loading)
-
-        if not meta then
-            UIManager:show(InfoMessage:new {
-                text = _("Error: ") .. (err or "?"), timeout = 5,
-            })
-            return
+    if repo_info and repo_info.mode == "attached"
+       and repo_info.local_path
+       and lfs.attributes(repo_info.local_path, "mode") == "directory"
+       and GitOps.isGitRepo(repo_info.local_path) then
+        BrowserUI.openAttachedRepo(full_name, repo_info, path, branch, on_close)
+    else
+        -- If registry says attached but local dir is gone, clean up registry
+        if repo_info and repo_info.mode == "attached" then
+            GitNotesSettings.removeRepoInfo(full_name)
         end
+        BrowserUI.openRemoteRepo(owner, repo, path, branch, on_close)
+    end
+end
 
-        branch = meta.default_branch or "main"
-        GithubBrowserSettings.addRecentRepo(full_name)
+-- ── Remote-Only Repo ──────────────────────────────────────────────────────────
+
+function BrowserUI.openRemoteRepo(owner, repo, path, branch, on_close)
+    if not NetworkMgr:isOnline() then
+        NetworkMgr:promptWifiOn(function()
+            BrowserUI.openRemoteRepo(owner, repo, path, branch, on_close)
+        end)
+        return
     end
 
-    -- Fetch directory contents
-    local loading2 = InfoMessage:new { text = _("Loading ..."), timeout = 30 }
+    local full_name = owner .. "/" .. repo
+    path = path or ""
+
+    if not branch then
+        local loading = InfoMessage:new{ text = _("Loading..."), timeout = 30 }
+        UIManager:show(loading)
+        UIManager:forceRePaint()
+        local meta, err = GitNotesAPI.getRepo(owner, repo)
+        UIManager:close(loading)
+        if not meta then
+            UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err or "?"), timeout = 5 })
+            return
+        end
+        branch = meta.default_branch or "main"
+        GitNotesSettings.addRecentRepo(full_name)
+    end
+
+    local loading2 = InfoMessage:new{ text = _("Loading..."), timeout = 30 }
     UIManager:show(loading2)
     UIManager:forceRePaint()
-
-    local contents, err2 = GithubBrowserAPI.getContents(owner, repo, path or "", branch)
+    local contents, err2 = GitNotesAPI.getContents(owner, repo, path or "", branch)
     UIManager:close(loading2)
 
     if not contents then
-        UIManager:show(InfoMessage:new {
-            text = _("Error: ") .. (err2 or "?"), timeout = 5,
-        })
+        UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err2 or "?"), timeout = 5 })
         return
     end
 
-    -- If API returned a single file object (not a directory listing)
     if contents.type == "file" then
-        GithubBrowserUI.showFile(owner, repo, contents, branch)
+        BrowserUI.showRemoteFile(owner, repo, contents, branch)
         return
     end
 
-    -- Sort: directories first, then alphabetical
     table.sort(contents, function(a, b)
         if a.type ~= b.type then return a.type == "dir" end
         return a.name:lower() < b.name:lower()
@@ -1021,563 +938,288 @@ function GithubBrowserUI.openRepo(owner, repo, path, branch, on_close)
     local items = {}
     local is_root = not path or path == ""
 
-    -- Back / Go up button (always at top)
     if is_root then
         table.insert(items, {
             text = "\u{ED0B} Back",
+            callback = function(menu) UIManager:close(menu); if on_close then on_close() end end,
+        })
+
+        local is_saved = GitNotesSettings.isSavedRepo(full_name)
+        table.insert(items, {
+            text = is_saved and _("★  Remove bookmark") or _("☆  Bookmark"),
             callback = function(menu)
+                if is_saved then GitNotesSettings.removeSavedRepo(full_name)
+                else GitNotesSettings.addSavedRepo(full_name) end
                 UIManager:close(menu)
-                if on_close then on_close() end
+                BrowserUI.openRemoteRepo(owner, repo, path, branch, on_close)
             end,
         })
 
-        -- Bookmark / unbookmark toggle
-        local is_saved = GithubBrowserSettings.isSavedRepo(full_name)
+        local is_pinned = GitNotesSettings.isPinnedRepo(full_name)
         table.insert(items, {
-            text = is_saved and _("★  Remove bookmark") or _("☆  Bookmark this repo"),
+            text = is_pinned and _("\u{EB03} Unpin") or _("\u{EB02} Pin to Home"),
             callback = function(menu)
-                if is_saved then
-                    GithubBrowserSettings.removeSavedRepo(full_name)
-                    UIManager:show(InfoMessage:new {
-                        text = _("Bookmark removed."), timeout = 2,
-                    })
-                else
-                    GithubBrowserSettings.addSavedRepo(full_name)
-                    UIManager:show(InfoMessage:new {
-                        text = _("Bookmarked!"), timeout = 2,
-                    })
-                end
+                if is_pinned then GitNotesSettings.removePinnedRepo(full_name)
+                else GitNotesSettings.addPinnedRepo(full_name) end
                 UIManager:close(menu)
-                -- Need to pass same path/branch so it doesn't lose state
-                GithubBrowserUI.openRepo(owner, repo, path, branch, on_close)
+                BrowserUI.openRemoteRepo(owner, repo, path, branch, on_close)
             end,
         })
 
-        -- Pin / unpin toggle
-        local is_pinned = GithubBrowserSettings.isPinnedRepo(full_name)
+        local cur_token = GitNotesSettings.getRepoTokens()[full_name] or _("Not set")
         table.insert(items, {
-            text = is_pinned and _("\u{EB03} Unpin from Home") or _("\u{EB02} Pin to Home"),
-            callback = function(menu)
-                if is_pinned then
-                    GithubBrowserSettings.removePinnedRepo(full_name)
-                    UIManager:show(InfoMessage:new {
-                        text = _("Unpinned."), timeout = 2,
-                    })
-                else
-                    GithubBrowserSettings.addPinnedRepo(full_name)
-                    UIManager:show(InfoMessage:new {
-                        text = _("Pinned!"), timeout = 2,
-                    })
-                end
-                UIManager:close(menu)
-                GithubBrowserUI.openRepo(owner, repo, path, branch, on_close)
-            end,
-        })
-
-        -- Change Token for this repo
-        local current_token_name = GithubBrowserSettings.getRepoTokens()[full_name] or _("Not set")
-        table.insert(items, {
-            text = _("\u{E60A} Change Token for this repo"),
-            mandatory = current_token_name,
+            text = _("\u{E60A} Change Token"),
+            mandatory = cur_token,
             callback = function(menu)
                 UIManager:close(menu)
-                GithubBrowserUI.showTokenSelectMenu(owner, repo, on_close)
+                BrowserUI.showTokenSelectMenu(owner, repo, on_close)
             end,
         })
 
         table.insert(items, {
-            text = _("\u{F414} Search files/folder"),
-            callback = function(menu)
-                UIManager:close(menu)
-                GithubBrowserUI.promptSearchRepo(owner, repo, branch, "filename", on_close)
-            end,
+            text = _("\u{F414} Search files"),
+            callback = function(menu) UIManager:close(menu); BrowserUI.promptSearchRepo(owner, repo, branch, "filename", on_close) end,
         })
-        
+
         table.insert(items, {
             text = _("\u{E91D} Search code"),
+            callback = function(menu) UIManager:close(menu); BrowserUI.promptSearchRepo(owner, repo, branch, "code", on_close) end,
+        })
+
+        table.insert(items, {
+            text = _("\u{EA9B} Attach to device"),
             callback = function(menu)
                 UIManager:close(menu)
-                GithubBrowserUI.promptSearchRepo(owner, repo, branch, "code", on_close)
+                BrowserUI.attachRepo(owner, repo, branch, on_close)
             end,
         })
     else
-        local parent_path = path:match("^(.+)/[^/]+$") or ""
         table.insert(items, {
             text = "\u{ED22} ..",
-            callback = function(menu)
-                UIManager:close(menu)
-            end,
+            callback = function(menu) UIManager:close(menu) end,
         })
     end
 
-    -- New file / folder buttons (only if token is available)
-    local repo_token = GithubBrowserSettings.getTokenForRepo(full_name)
-    if repo_token and repo_token ~= "" then
+    local token = GitNotesSettings.getTokenForRepo(full_name)
+    local repo_tokens = GitNotesSettings.getRepoTokens()
+    local has_explicit_token = repo_tokens[full_name] and token ~= ""
+    if has_explicit_token then
         table.insert(items, {
-            text = _("\u{EA9B} New file here"),
-            callback = function()
-                GithubBrowserUI.createNewFile(owner, repo, path or "", branch, on_close)
-            end,
-        })
-        table.insert(items, {
-            text = _("\u{E956} New folder here"),
-            callback = function()
-                GithubBrowserUI.createNewFolder(owner, repo, path or "", branch, on_close)
-            end,
+            text = _("\u{EA9B} New file"),
+            callback = function() BrowserUI.createRemoteFile(owner, repo, path or "", branch, on_close) end,
         })
     end
 
-    -- Separator
     if #items > 0 then
-        table.insert(items, {
-            text = "────────────────────",
-            callback = function() end,
-        })
+        table.insert(items, { text = "────────────────────", callback = function() end })
     end
 
-    -- Directory entries
-    for i, entry in ipairs(contents) do
+    for _, entry in ipairs(contents) do
         if entry.type == "dir" then
             table.insert(items, {
                 text = "\u{E94A} " .. entry.name .. "/",
-                callback = function()
-                    GithubBrowserUI.openRepo(owner, repo, entry.path, branch)
-                end,
+                callback = function() BrowserUI.openRemoteRepo(owner, repo, entry.path, branch, on_close) end,
                 hold_callback = function()
-                    GithubBrowserUI.handleEntryHold(owner, repo, entry, branch, on_close)
+                    BrowserUI.handleRemoteEntryHold(owner, repo, entry, branch, on_close)
                 end,
             })
         else
             table.insert(items, {
                 text = "\u{F016} " .. entry.name,
-                mandatory = GithubBrowserAPI.formatSize(entry.size),
-                callback = function()
-                    GithubBrowserUI.showFile(owner, repo, entry, branch)
-                end,
+                mandatory = GitNotesAPI.formatSize(entry.size),
+                callback = function() BrowserUI.showRemoteFile(owner, repo, entry, branch) end,
                 hold_callback = function()
-                    GithubBrowserUI.handleEntryHold(owner, repo, entry, branch, on_close)
+                    BrowserUI.handleRemoteEntryHold(owner, repo, entry, branch, on_close)
                 end,
             })
         end
     end
 
-    -- Build title
-    local title
-    if is_root then
-        title = full_name .. " [" .. branch .. "]"
-    else
-        title = full_name .. "/" .. path
-    end
-
-    UIManager:show(BrowserMenu:new {
-        title      = title,
-        item_table = items,
-        on_close   = is_root and on_close or nil,
-    })
+    local title = is_root and (full_name .. " [" .. branch .. "]") or (full_name .. "/" .. path)
+    UIManager:show(BrowserMenu:new{ title = title, item_table = items, on_close = is_root and on_close or nil })
 end
 
--- ── Create New File ───────────────────────────────────────────────────────────
-
-function GithubBrowserUI.createNewFile(owner, repo, dir_path, branch, on_close)
-    local dlg
-    dlg = InputDialog:new {
-        title = _("New File Name"),
-        input = "",
-        input_hint = _("e.g. notes.md or subdir/file.txt"),
-        buttons = {{
-            {
-                text = _("Cancel"),
-                callback = function() UIManager:close(dlg) end,
-            },
-            {
-                text = _("Next"),
-                is_enter_default = true,
-                callback = function()
-                    local fname = dlg:getInputText()
-                    UIManager:close(dlg)
-                    fname = fname:match("^%s*(.-)%s*$")
-                    if fname == "" then return end
-                    local fpath = (dir_path ~= "" and dir_path .. "/" or "") .. fname
-                    GithubBrowserUI._editNewFile(owner, repo, fpath, branch, on_close)
-                end,
-            },
-        }},
-    }
-    UIManager:show(dlg)
-    dlg:onShowKeyboard()
-end
-
-function GithubBrowserUI._editNewFile(owner, repo, file_path, branch, on_close)
-    local editor
-    editor = InputDialog:new {
-        title = _("New: ") .. file_path,
-        input = "",
-        allow_newline = true,
-        fullscreen = true,
-        buttons = {{
-            {
-                text = _("Cancel"),
-                callback = function() UIManager:close(editor) end,
-            },
-            {
-                text = _("💾 Commit"),
-                is_enter_default = true,
-                callback = function()
-                    local content = editor:getInputText()
-                    UIManager:close(editor)
-                    -- For new files, sha is nil
-                    GithubBrowserUI._askCommitMsg(owner, repo, file_path, content, nil, branch)
-                end,
-            },
-        }},
-    }
-    UIManager:show(editor)
-    editor:onShowKeyboard()
-end
-
-function GithubBrowserUI.createNewFolder(owner, repo, dir_path, branch, on_close)
-    local dlg
-    dlg = InputDialog:new {
-        title = _("New Folder Name"),
-        input = "",
-        input_hint = _("e.g. my-notes"),
-        buttons = {{
-            {
-                text = _("Cancel"),
-                callback = function() UIManager:close(dlg) end,
-            },
-            {
-                text = _("Create"),
-                is_enter_default = true,
-                callback = function()
-                    local folder = dlg:getInputText()
-                    UIManager:close(dlg)
-                    folder = folder:match("^%s*(.-)%s*$")
-                    if folder == "" then return end
-                    -- GitHub needs a file to create a directory; use .gitkeep
-                    local fpath = (dir_path ~= "" and dir_path .. "/" or "") .. folder .. "/.gitkeep"
-                    GithubBrowserUI._askCommitMsg(owner, repo, fpath, "", nil, branch)
-                end,
-            },
-        }},
-    }
-    UIManager:show(dlg)
-    dlg:onShowKeyboard()
-end
-
-function GithubBrowserUI.handleEntryHold(owner, repo, entry, branch, on_close)
-    local token = GithubBrowserSettings.getTokenForRepo(owner .. "/" .. repo)
-    
-    if token and token ~= "" then
-        -- Has write access -> Show Delete ConfirmBox
-        UIManager:show(ConfirmBox:new {
-            text = _("Are you sure you want to delete ") .. entry.name .. "?\n" .. (entry.type == "dir" and _("(This will recursively delete all files inside it)") or ""),
+function BrowserUI.handleRemoteEntryHold(owner, repo, entry, branch, on_close)
+    local full_name = owner .. "/" .. repo
+    local token = GitNotesSettings.getTokenForRepo(full_name)
+    local repo_tokens = GitNotesSettings.getRepoTokens()
+    local has_explicit_token = repo_tokens[full_name] and token ~= ""
+    if has_explicit_token then
+        UIManager:show(ConfirmBox:new{
+            text = _("Delete ") .. entry.name .. "?",
             ok_text = _("Delete"),
-            cancel_text = _("Cancel"),
             ok_callback = function()
-                GithubBrowserUI._doDelete(owner, repo, entry, branch, token, on_close)
+                local loading = InfoMessage:new{ text = _("Deleting..."), timeout = 120 }
+                UIManager:show(loading)
+                UIManager:forceRePaint()
+                local device = GitNotesSettings.getDeviceName()
+                local msg = string.format("Delete %s from %s on %s", entry.name, device, os.date("%c"))
+                local ok, err
+                if entry.type == "dir" then
+                    ok, err = GitNotesAPI.deleteDirectory(owner, repo, entry.path, branch, msg, token)
+                else
+                    ok, err = GitNotesAPI.deleteFile(owner, repo, entry.path, entry.sha, branch, msg, token)
+                end
+                UIManager:close(loading)
+                if not ok then
+                    UIManager:show(InfoMessage:new{ text = _("Delete failed: ") .. (err or "?"), timeout = 6 })
+                else
+                    UIManager:show(InfoMessage:new{ text = _("Deleted!"), timeout = 2 })
+                    local parent = entry.path:match("^(.+)/[^/]+$") or ""
+                    UIManager:scheduleIn(1, function()
+                        BrowserUI.openRemoteRepo(owner, repo, parent, branch, on_close)
+                    end)
+                end
             end,
         })
-    else
-        -- No write access -> If file, show Download ConfirmBox
-        if entry.type == "file" and entry.download_url then
-            UIManager:show(ConfirmBox:new {
-                text = string.format(_("Download \"%s\"?"), entry.name),
-                ok_text = _("Download"),
-                cancel_text = _("Cancel"),
-                ok_callback = function()
-                    GithubBrowserUI.downloadFile(entry.name, entry.download_url)
-                end,
-            })
-        else
-            UIManager:show(InfoMessage:new { text = _("Read-only. No actions available."), timeout = 2 })
-        end
-    end
-end
-
-function GithubBrowserUI._doDelete(owner, repo, entry, branch, token, on_close)
-    local loading = InfoMessage:new { text = _("Deleting ..."), timeout = 120 }
-    UIManager:show(loading)
-    UIManager:forceRePaint()
-
-    local device = GithubBrowserSettings.getDeviceName()
-    local date_str = os.date("%m/%d/%Y, %I:%M:%S %p")
-    local msg = string.format("Delete %s from %s on %s", entry.name, device, date_str)
-
-    local ok, err
-    if entry.type == "dir" then
-        ok, err = GithubBrowserAPI.deleteDirectory(owner, repo, entry.path, branch, msg, token)
-    else
-        ok, err = GithubBrowserAPI.deleteFile(owner, repo, entry.path, entry.sha, branch, msg, token)
-    end
-
-    UIManager:close(loading)
-
-    if not ok then
-        UIManager:show(InfoMessage:new {
-            text = _("Delete failed: ") .. (err or "?"),
-            timeout = 6,
+    elseif entry.type == "file" and entry.download_url then
+        UIManager:show(ConfirmBox:new{
+            text = string.format(_("Download \"%s\"?"), entry.name),
+            ok_text = _("Download"),
+            ok_callback = function() BrowserUI.downloadFile(entry.name, entry.download_url) end,
         })
-        return
+    else
+        UIManager:show(InfoMessage:new{ text = _("Read-only. No actions available."), timeout = 2 })
     end
-
-    UIManager:show(InfoMessage:new {
-        text = _("✅ Deleted!"),
-        timeout = 2,
-    })
-
-    -- Auto-refresh: re-open the parent directory
-    local parent_path = entry.path:match("^(.+)/[^/]+$") or ""
-    UIManager:scheduleIn(1, function()
-        GithubBrowserUI.openRepo(owner, repo, parent_path, branch, on_close)
-    end)
 end
 
--- ── Show File ─────────────────────────────────────────────────────────────────
-
-function GithubBrowserUI.showFile(owner, repo, entry, branch)
+function BrowserUI.showRemoteFile(owner, repo, entry, branch)
     local name = entry.name or "file"
     local download_url = entry.download_url
 
     if isTextFile(name) and download_url then
-        -- Fetch and display text content
-        local loading = InfoMessage:new { text = _("Fetching ..."), timeout = 30 }
+        local loading = InfoMessage:new{ text = _("Fetching..."), timeout = 30 }
         UIManager:show(loading)
         UIManager:forceRePaint()
-
-        local text, err = GithubBrowserAPI.getRawFile(download_url)
+        local text, err = GitNotesAPI.getRawFile(download_url)
         UIManager:close(loading)
-
         if not text then
-            UIManager:show(InfoMessage:new {
-                text = _("Error: ") .. (err or "?"), timeout = 4,
-            })
+            UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err or "?"), timeout = 4 })
             return
         end
 
-        -- Truncate very large files
         local truncated = false
         if #text > 50000 then
             text = text:sub(1, 50000)
             truncated = true
         end
-        if truncated then
-            text = text .. "\n\n── [ truncated at 50k chars ] ──"
-        end
+        if truncated then text = text .. "\n\n── [ truncated ] ──" end
 
-        local full_text = text
-        local token = GithubBrowserSettings.getTokenForRepo(owner .. "/" .. repo)
-
-        -- Build buttons
+        local token = GitNotesSettings.getTokenForRepo(owner .. "/" .. repo)
+        local repo_tokens = GitNotesSettings.getRepoTokens()
+        local has_explicit_token = repo_tokens[owner .. "/" .. repo] and token ~= ""
+        local full_name = owner .. "/" .. repo
         local buttons = {}
-        if token ~= "" and entry.path and entry.sha and not truncated then
+        if has_explicit_token and entry.path and entry.sha and not truncated then
             table.insert(buttons, {{
                 text = _("\u{EAEB} Edit"),
                 callback = function()
-                    GithubBrowserUI.editFile(owner, repo, entry.path, full_text, entry.sha, branch)
+                    BrowserUI.editRemoteFile(owner, repo, entry.path, text, entry.sha, branch)
+                end,
+            }})
+        end
+        -- Edit Locally: download to disk and open in local editor (no token needed)
+        if entry.path and not truncated then
+            table.insert(buttons, {{
+                text = _("\u{F016} Edit Locally"),
+                callback = function()
+                    BrowserUI.editRemoteFileLocally(owner, repo, entry.path, text, branch, entry.sha)
                 end,
             }})
         end
         if download_url then
             table.insert(buttons, {{
                 text = _("\u{F317} Download"),
-                callback = function()
-                    GithubBrowserUI.downloadFile(name, download_url)
-                end,
+                callback = function() BrowserUI.downloadFile(name, download_url) end,
             }})
         end
 
-        UIManager:show(TextViewer:new {
+        UIManager:show(TextViewer:new{
             title = name,
-            text  = text,
+            text = text,
             height = math.floor(Screen:getHeight() * 0.85),
             buttons_table = #buttons > 0 and buttons or nil,
         })
-
     elseif download_url then
-        -- Binary / openable file — offer download
-        UIManager:show(ConfirmBox:new {
+        UIManager:show(ConfirmBox:new{
             text = string.format(_("Download \"%s\"?"), name),
             ok_text = _("Download"),
-            cancel_text = _("Cancel"),
-            ok_callback = function()
-                GithubBrowserUI.downloadFile(name, download_url)
-            end,
+            ok_callback = function() BrowserUI.downloadFile(name, download_url) end,
         })
     else
-        UIManager:show(InfoMessage:new {
-            text = _("No download URL available."), timeout = 3,
-        })
+        UIManager:show(InfoMessage:new{ text = _("Cannot display this file."), timeout = 3 })
     end
 end
 
--- ── Download File ─────────────────────────────────────────────────────────────
+function BrowserUI.editRemoteFile(owner, repo, path, content, sha, branch)
+    local EditorToolbar = require("githubbrowser_editor_toolbar")
+    local UndoStack     = require("githubbrowser_undo")
 
-function GithubBrowserUI.downloadFile(name, url)
-    local dir = GithubBrowserSettings.getDownloadDir()
-    ensureDir(dir)
-    local dest = dir .. "/" .. name
+    local undo_stack = UndoStack.new(GitNotesSettings.getUndoStackSize())
+    undo_stack:push(content, 1)
 
-    local loading = InfoMessage:new { text = _("Downloading ..."), timeout = 60 }
-    UIManager:show(loading)
-    UIManager:forceRePaint()
-
-    local ok, err = GithubBrowserAPI.downloadFile(url, dest)
-    UIManager:close(loading)
-
-    if not ok then
-        UIManager:show(InfoMessage:new {
-            text = _("Failed: ") .. (err or "?"), timeout = 4,
-        })
-        return
-    end
-
-    if isOpenable(name) then
-        UIManager:show(ConfirmBox:new {
-            text = string.format(_("Saved to:\n%s\n\nOpen now?"), dest),
-            ok_text = _("Open"),
-            cancel_text = _("Close"),
-            ok_callback = function()
-                local Event = require("ui/event")
-                UIManager:broadcastEvent(Event:new("OpenDocument", dest))
-            end,
-        })
-    else
-        UIManager:show(InfoMessage:new {
-            text = _("Saved to:\n") .. dest, timeout = 4,
-        })
-    end
-end
-
--- ── Edit File ─────────────────────────────────────────────────────────────────
-
-function GithubBrowserUI.editFile(owner, repo, file_path, original_text, sha, branch)
-    local editor
-    editor = InputDialog:new {
-        title = _("Edit: ") .. (file_path:match("[^/]+$") or file_path),
-        input = original_text,
-        allow_newline = true,
-        cursor_at_end = false,
-        fullscreen = true,
-        buttons = {{
-            {
-                text = _("Cancel"),
-                callback = function() UIManager:close(editor) end,
-            },
-            {
-                text = _("💾 Commit"),
-                is_enter_default = true,
-                callback = function()
-                    local new_text = editor:getInputText()
-                    UIManager:close(editor)
-                    if new_text == original_text then
-                        UIManager:show(InfoMessage:new { text = _("No changes."), timeout = 2 })
-                        return
-                    end
-                    GithubBrowserUI._askCommitMsg(owner, repo, file_path, new_text, sha, branch)
-                end,
-            },
-        }},
-    }
-    UIManager:show(editor)
-    editor:onShowKeyboard()
-end
-
-function GithubBrowserUI._askCommitMsg(owner, repo, file_path, content, sha, branch)
-    local name = file_path:match("[^/]+$") or file_path
     local dlg
-    dlg = InputDialog:new {
-        title = _("Commit Message"),
-        input = "",
-        input_hint = _("Leave blank for auto-generated msg"),
-        description = string.format("%s/%s [%s]", owner, repo, branch),
+    dlg = InputDialog:new{
+        title = _("Edit: ") .. path,
+        input = content,
+        input_face = Font:getFace(GitNotesSettings.getFontFace(), GitNotesSettings.getFontSize()),
+        allow_newline = true,
+        fullscreen = true,
+        condensed = true,
+        add_nav_bar = true,
+        scroll_by_pan = true,
         buttons = {{
-            {
-                text = _("Cancel"),
-                callback = function() UIManager:close(dlg) end,
-            },
-            {
-                text = _("Commit"),
-                is_enter_default = true,
-                callback = function()
-                    local msg = dlg:getInputText()
-                    UIManager:close(dlg)
-                    
-                    local device = GithubBrowserSettings.getDeviceName()
-                    
-                    if not msg or msg:match("^%s*$") then
-                        local date_str = os.date("%m/%d/%Y, %I:%M:%S %p")
-                        -- Format: Update Untitled from RIGHT9xOS on 5/11/2026, 8:08:47 PM
-                        msg = string.format("Update %s from %s on %s", name, device, date_str)
-                    else
-                        -- Append device name for custom messages
-                        msg = msg .. "\n\nby " .. device
-                    end
-                    
-                    GithubBrowserUI._doCommit(owner, repo, file_path, content, sha, branch, msg)
-                end,
-            },
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("💾 Commit"), is_enter_default = true, callback = function()
+                local new_content = dlg:getInputText()
+                UIManager:close(dlg)
+                BrowserUI._askRemoteCommitMsg(owner, repo, path, new_content, sha, branch)
+            end },
         }},
     }
+
+    local toolbar = EditorToolbar:new{
+        input_dialog = dlg,
+        bar_width    = dlg:getAddedWidgetAvailableWidth(),
+    }
+    toolbar:setUndoStack(undo_stack)
+    dlg:addWidget(toolbar.widget)
+
+    local orig_edit_cb = dlg._input_widget.edit_callback
+    dlg._input_widget.edit_callback = function()
+        if toolbar.restoring then return end
+        if orig_edit_cb then orig_edit_cb(true) end
+        local iw = dlg._input_widget
+        local text = iw:getText()
+        undo_stack:push(text, iw.charpos)
+    end
+
     UIManager:show(dlg)
     dlg:onShowKeyboard()
 end
 
-function GithubBrowserUI._doCommit(owner, repo, file_path, content, sha, branch, msg)
-    local loading = InfoMessage:new { text = _("Committing ..."), timeout = 60 }
-    UIManager:show(loading)
-    UIManager:forceRePaint()
-
-    local token = GithubBrowserSettings.getTokenForRepo(owner .. "/" .. repo)
-    local result, err = GithubBrowserAPI.updateFile(owner, repo, file_path, content, sha, branch, msg, token)
-    UIManager:close(loading)
-
-    if not result then
-        UIManager:show(InfoMessage:new {
-            text = _("Commit failed: ") .. (err or "?"),
-            timeout = 6,
-        })
-        return
-    end
-
-    local csha = (result.commit and result.commit.sha) and result.commit.sha:sub(1, 7) or ""
-    UIManager:show(InfoMessage:new {
-        text = _("✅ Committed! ") .. csha,
-        timeout = 2,
-    })
-
-    -- Auto-refresh: re-open the parent directory
-    local parent_path = file_path:match("^(.+)/[^/]+$") or ""
-    UIManager:scheduleIn(1, function()
-        GithubBrowserUI.openRepo(owner, repo, parent_path, branch)
-    end)
-end
-
-function GithubBrowserUI.promptSearchRepo(owner, repo, branch, search_type, on_close)
-    local InputDialog = require("ui/widget/inputdialog")
-    local title = search_type == "filename" and _("Search files/folder in repo") or _("Search code in repo")
-    
+function BrowserUI._askRemoteCommitMsg(owner, repo, path, content, sha, branch)
     local dlg
-    dlg = InputDialog:new {
-        title = title,
-        input = "",
-        input_type = "string",
+    dlg = InputDialog:new{
+        title = _("Commit message"),
+        input = "Update " .. path,
         buttons = {{
-            { text = _("Cancel"), id = "close", callback = function()
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Commit"), is_enter_default = true, callback = function()
+                local msg = dlg:getInputText()
                 UIManager:close(dlg)
-                GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
-            end },
-            { text = _("Search"), is_enter = true, callback = function()
-                local query = dlg:getInputValue()
-                UIManager:close(dlg)
-                if query and query ~= "" then
-                    if search_type == "filename" then
-                        GithubBrowserUI.searchRepoFilenames(owner, repo, branch, query, on_close)
-                    else
-                        GithubBrowserUI.searchRepoCode(owner, repo, branch, query, on_close)
-                    end
+                local loading = InfoMessage:new{ text = _("Committing..."), timeout = 60 }
+                UIManager:show(loading)
+                UIManager:forceRePaint()
+                local token = GitNotesSettings.getTokenForRepo(owner .. "/" .. repo)
+                local device = GitNotesSettings.getDeviceName()
+                local full_msg = msg .. "\n\nFrom: " .. device
+                local ok, err = GitNotesAPI.updateFile(owner, repo, path, content, sha, branch, full_msg, token)
+                UIManager:close(loading)
+                if ok then
+                    UIManager:show(InfoMessage:new{ text = _("Committed!"), timeout = 2 })
                 else
-                    GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
+                    UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err or "?"), timeout = 6 })
                 end
             end },
         }},
@@ -1586,118 +1228,758 @@ function GithubBrowserUI.promptSearchRepo(owner, repo, branch, search_type, on_c
     dlg:onShowKeyboard()
 end
 
-function GithubBrowserUI.searchRepoFilenames(owner, repo, branch, query, on_close)
-    local loading = InfoMessage:new { text = _("Fetching repository tree..."), timeout = 0 }
-    UIManager:show(loading)
-    UIManager:forceRePaint()
-
-    local tree_data, err = GithubBrowserAPI.getTree(owner, repo, branch)
-    UIManager:close(loading)
-
-    if not tree_data or not tree_data.tree then
-        UIManager:show(InfoMessage:new { text = _("Search failed: ") .. (err or "?"), timeout = 4 })
-        GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
-        return
-    end
-
-    local query_lower = query:lower()
-    local results = {}
-    for _, item in ipairs(tree_data.tree) do
-        if item.type == "blob" and item.path:lower():find(query_lower, 1, true) then
-            table.insert(results, item)
-            if #results >= 100 then break end
-        end
-    end
-
-    GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, "filename")
+function BrowserUI.createRemoteFile(owner, repo, dir_path, branch, on_close)
+    local dlg
+    dlg = InputDialog:new{
+        title = _("New File Name"),
+        input = "",
+        input_hint = _("e.g. notes.md"),
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Next"), is_enter_default = true, callback = function()
+                local fname = dlg:getInputText():match("^%s*(.-)%s*$")
+                UIManager:close(dlg)
+                if fname == "" then return end
+                local fpath = (dir_path ~= "" and dir_path .. "/" or "") .. fname
+                local editor
+                editor = InputDialog:new{
+                    title = _("New: ") .. fpath,
+                    input = "",
+                    allow_newline = true,
+                    fullscreen = true,
+                    buttons = {{
+                        { text = _("Cancel"), callback = function() UIManager:close(editor) end },
+                        { text = _("💾 Commit"), is_enter_default = true, callback = function()
+                            local content = editor:getInputText()
+                            UIManager:close(editor)
+                            BrowserUI._askRemoteCommitMsg(owner, repo, fpath, content, nil, branch)
+                        end },
+                    }},
+                }
+                UIManager:show(editor)
+                editor:onShowKeyboard()
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
 end
 
-function GithubBrowserUI.searchRepoCode(owner, repo, branch, query, on_close)
-    local loading = InfoMessage:new { text = _("Searching code..."), timeout = 0 }
+function BrowserUI.downloadFile(name, url)
+    local dl_dir = GitNotesSettings.getDownloadDir()
+    ensureDir(dl_dir)
+    local dest = dl_dir .. "/" .. name
+    local loading = InfoMessage:new{ text = _("Downloading..."), timeout = 120 }
     UIManager:show(loading)
     UIManager:forceRePaint()
-
-    local data, err = GithubBrowserAPI.searchCode(owner, repo, query)
+    local ok, err = GitNotesAPI.downloadFile(url, dest)
     UIManager:close(loading)
-
-    if not data then
-        local msg = err or "?"
-        if msg:find("HTTP 401") or msg:find("HTTP 403") or msg:find("Requires authentication") then
-            msg = _("Rate limit exceeded or token required.\nPlease add a GitHub Token in settings.")
-        end
-        UIManager:show(InfoMessage:new { text = _("Search failed: ") .. msg, timeout = 5 })
-        GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
-        return
-    end
-
-    local results = {}
-    if data.items then
-        for _, item in ipairs(data.items) do
-            local snippet = ""
-            if item.text_matches and #item.text_matches > 0 then
-                snippet = item.text_matches[1].fragment or ""
-                -- Replace all control characters (newlines, tabs, etc) with a space
-                snippet = snippet:gsub("%c", " ")
-                -- Truncate heavily to prevent TextWidget layout crashes on smaller e-ink screens
-                if #snippet > 40 then snippet = snippet:sub(1, 40) .. "..." end
-            end
-            table.insert(results, {
-                path = item.path,
-                type = "blob",
-                snippet = snippet,
-                url = item.html_url
-            })
-        end
-    end
-
-    GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, "code")
-end
-
-function GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, search_type)
-    local items = {}
-    
-    table.insert(items, {
-        text = "\u{ED0B} Back to repo root",
-        callback = function(menu)
-            UIManager:close(menu)
-            GithubBrowserUI.openRepo(owner, repo, "", branch, on_close)
-        end,
-    })
-
-    if #results == 0 then
-        table.insert(items, { text = _("No matching files found."), unselectable = true })
+    if ok then
+        UIManager:show(InfoMessage:new{ text = _("Saved to: ") .. dest, timeout = 4 })
     else
-        table.sort(results, function(a, b) return a.path:lower() < b.path:lower() end)
-        for _, item in ipairs(results) do
-            local file_name = item.path:match("([^/]+)$") or item.path
-            local dir_path = item.path:match("^(.*)/[^/]+$") or ""
-            local size_str = item.size and GithubBrowserAPI.formatSize(item.size) or ""
-            
-            local mandatory_str = size_str ~= "" and size_str or dir_path
-            if item.snippet and item.snippet ~= "" then
-                mandatory_str = item.snippet
-            end
-            
-            local icon = search_type == "code" and "\u{E91D} " or "\u{F414} "
-            
+        UIManager:show(InfoMessage:new{ text = _("Download failed: ") .. (err or "?"), timeout = 5 })
+    end
+end
+
+function BrowserUI.promptSearchRepo(owner, repo, branch, search_type, on_close)
+    local dlg
+    dlg = InputDialog:new{
+        title = search_type == "code" and _("Search code in ") .. repo or _("Search files in ") .. repo,
+        input = "",
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Search"), is_enter_default = true, callback = function()
+                local query = dlg:getInputText():match("^%s*(.-)%s*$")
+                UIManager:close(dlg)
+                if query == "" then return end
+                if search_type == "code" then
+                    BrowserUI.doCodeSearch(owner, repo, query, on_close)
+                else
+                    BrowserUI.doFileNameSearch(owner, repo, branch, query, on_close)
+                end
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+function BrowserUI.doFileNameSearch(owner, repo, branch, query, on_close)
+    local loading = InfoMessage:new{ text = _("Searching..."), timeout = 30 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+    local tree, err = GitNotesAPI.getTree(owner, repo, branch)
+    UIManager:close(loading)
+    if not tree then
+        UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err or "?"), timeout = 5 })
+        return
+    end
+    local q_lower = query:lower()
+    local items = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); BrowserUI.openRemoteRepo(owner, repo, nil, branch, on_close) end,
+    })
+    for _, node in ipairs(tree.tree or {}) do
+        if node.type == "blob" and node.path:lower():find(q_lower, 1, true) then
             table.insert(items, {
-                text = icon .. file_name,
-                mandatory = mandatory_str,
-                callback = function(menu)
-                    UIManager:close(menu)
-                    GithubBrowserUI.openRepo(owner, repo, item.path, branch, function()
-                        GithubBrowserUI.showSearchResults(owner, repo, branch, query, results, on_close, search_type)
-                    end)
+                text = node.path,
+                callback = function()
+                    local fetching = InfoMessage:new{ text = _("Fetching..."), timeout = 30 }
+                    UIManager:show(fetching)
+                    UIManager:forceRePaint()
+                    local raw_url = string.format(
+                        "https://raw.githubusercontent.com/%s/%s/%s/%s",
+                        owner, repo, branch, node.path
+                    )
+                    local text, err2 = GitNotesAPI.getRawFile(raw_url)
+                    UIManager:close(fetching)
+                    if text then
+                        UIManager:show(TextViewer:new{
+                            title = node.path:match("([^/]+)$"),
+                            text = #text > 50000 and text:sub(1, 50000) .. "\n\n── [ truncated ] ──" or text,
+                            height = math.floor(Screen:getHeight() * 0.85),
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err2 or "?"), timeout = 4 })
+                    end
                 end,
             })
         end
     end
-
-    UIManager:show(BrowserMenu:new {
-        title = string.format(_("Search Results: '%s' (%d)"), query, #results),
+    if #items == 1 then
+        table.insert(items, { text = _("   No results."), callback = function() end })
+    end
+    UIManager:show(BrowserMenu:new{
+        title = _("Results: ") .. query,
         item_table = items,
-        on_close = on_close,
     })
 end
 
-return GithubBrowserUI
+function BrowserUI.doCodeSearch(owner, repo, query, on_close)
+    local loading = InfoMessage:new{ text = _("Searching..."), timeout = 30 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+    local results, err = GitNotesAPI.searchCode(owner, repo, query)
+    UIManager:close(loading)
+    if not results then
+        UIManager:show(InfoMessage:new{ text = _("Error: ") .. (err or "?"), timeout = 5 })
+        return
+    end
+    local items = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu) UIManager:close(menu); BrowserUI.openRemoteRepo(owner, repo, nil, nil, on_close) end,
+    })
+    for _, item in ipairs(results.items or {}) do
+        table.insert(items, {
+            text = item.path or item.name or "?",
+            callback = function()
+                if item.html_url then
+                    UIManager:show(InfoMessage:new{
+                        text = item.path .. "\n\nSee: " .. item.html_url,
+                        timeout = 6,
+                    })
+                end
+            end,
+        })
+    end
+    if #items == 1 then
+        table.insert(items, { text = _("   No results."), callback = function() end })
+    end
+    UIManager:show(BrowserMenu:new{
+        title = _("Code: ") .. query,
+        item_table = items,
+    })
+end
+
+-- ── Attach (Clone) ────────────────────────────────────────────────────────────
+
+function BrowserUI.attachRepo(owner, repo, branch, on_close)
+    if not NetworkMgr:isOnline() then
+        NetworkMgr:promptWifiOn(function()
+            BrowserUI.attachRepo(owner, repo, branch, on_close)
+        end)
+        return
+    end
+
+    local full_name = owner .. "/" .. repo
+    local workspace = GitNotesSettings.getWorkspace()
+    ensureDir(workspace)
+    local dest = workspace .. "/" .. repo
+
+    if lfs.attributes(dest, "mode") then
+        UIManager:show(ConfirmBox:new{
+            text = string.format(_("Directory \"%s\" already exists.\nOverwrite?"), dest),
+            ok_text = _("Overwrite"),
+            ok_callback = function() BrowserUI._doClone(owner, repo, branch, dest, on_close) end,
+        })
+    else
+        BrowserUI._doClone(owner, repo, branch, dest, on_close)
+    end
+end
+
+function BrowserUI._doClone(owner, repo, branch, dest, on_close)
+    local full_name = owner .. "/" .. repo
+    local token = GitNotesSettings.getTokenForRepo(full_name)
+
+    local loading = InfoMessage:new{ text = _("Cloning..."), timeout = 300 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+
+    local url = "https://github.com/" .. owner .. "/" .. repo .. ".git"
+    local shallow = GitNotesSettings.getShallowCloneDefault()
+    local ok, output = GitOps.clone(url, dest, token, shallow)
+
+    UIManager:close(loading)
+
+    if not ok then
+        UIManager:show(InfoMessage:new{ text = _("Clone failed:\n") .. (output or "?"), timeout = 8 })
+        return
+    end
+
+    -- Get current HEAD hash for sync tracking
+    local handle = io.popen(string.format("cd %q && git rev-parse HEAD 2>&1", dest))
+    local hash = handle and handle:read("*a"):gsub("%s+$", "") or ""
+    if handle then handle:close() end
+
+    GitNotesSettings.setRepoInfo(full_name, {
+        mode           = "attached",
+        local_path     = dest,
+        branch         = branch or GitOps.getCurrentBranch(dest) or "main",
+        last_sync_hash = hash,
+        last_sync_time = os.time(),
+    })
+
+    UIManager:show(InfoMessage:new{ text = _("Cloned to: ") .. dest, timeout = 4 })
+    if on_close then on_close() end
+end
+
+-- ── Attached (Local) Repo ─────────────────────────────────────────────────────
+
+function BrowserUI.openAttachedRepo(full_name, repo_info, path, branch, on_close)
+    local repo_path = repo_info.local_path
+    if not repo_path or lfs.attributes(repo_path, "mode") ~= "directory" then
+        UIManager:show(InfoMessage:new{ text = _("Local repo not found. Falling back to remote."), timeout = 3 })
+        GitNotesSettings.removeRepoInfo(full_name)
+        local owner, repo = full_name:match("^([^/]+)/(.+)$")
+        if owner then BrowserUI.openRemoteRepo(owner, repo, path, branch, on_close) end
+        return
+    end
+    branch = branch or repo_info.branch or GitOps.getCurrentBranch(repo_path) or "main"
+    path = path or ""
+
+    local items = {}
+    local is_root = path == ""
+    local owner, repo = full_name:match("^([^/]+)/(.+)$")
+
+    if is_root then
+        -- Auto-sync check
+        if GitNotesSettings.getAutoSyncOnOpen() and not BrowserUI._sync_checked[full_name] then
+            BrowserUI._sync_checked[full_name] = true
+            local status = SyncEngine.checkStatus(repo_path, branch)
+            if status == "remote_ahead" then
+                local changes = SyncEngine.getRemoteChanges(repo_path, branch, 5)
+                table.insert(items, {
+                    text = "\u{EA2E} " .. string.format(_("%d remote changes (tap to pull)"), #changes),
+                    callback = function()
+                        local ok, err = GitOps.pull(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                        if ok then
+                            UIManager:show(InfoMessage:new{ text = _("Pulled!"), timeout = 2 })
+                        else
+                            UIManager:show(InfoMessage:new{ text = _("Pull failed: ") .. (err or "?"), timeout = 5 })
+                        end
+                        BrowserUI.openRepo(owner, repo, nil, branch, on_close)
+                    end,
+                })
+            elseif status == "local_ahead" then
+                table.insert(items, {
+                    text = "\u{EA2D} Local commits ready to push",
+                    callback = function() BrowserUI.showRecentChanges(full_name, repo_info, on_close) end,
+                })
+            end
+        end
+
+        table.insert(items, {
+            text = "\u{ED0B} Back",
+            callback = function(menu) UIManager:close(menu); if on_close then on_close() end end,
+        })
+
+        local is_saved = GitNotesSettings.isSavedRepo(full_name)
+        table.insert(items, {
+            text = is_saved and _("★  Remove bookmark") or _("☆  Bookmark"),
+            callback = function(menu)
+                if is_saved then GitNotesSettings.removeSavedRepo(full_name)
+                else GitNotesSettings.addSavedRepo(full_name) end
+                UIManager:close(menu)
+                BrowserUI.openRepo(owner, repo, nil, branch, on_close)
+            end,
+        })
+
+        table.insert(items, {
+            text = _("\u{EA2E} Pull"),
+            callback = function()
+                if not NetworkMgr:isOnline() then
+                    NetworkMgr:promptWifiOn(function()
+                        local ok, err = GitOps.pull(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                        UIManager:show(InfoMessage:new{
+                            text = ok and _("Pulled!") or ("Pull failed: " .. (err or "?")),
+                            timeout = ok and 3 or 5,
+                        })
+                    end)
+                    return
+                end
+                local ok, err = GitOps.pull(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                UIManager:show(InfoMessage:new{
+                    text = ok and _("Pulled!") or ("Pull failed: " .. (err or "?")),
+                    timeout = ok and 3 or 5,
+                })
+            end,
+        })
+
+        table.insert(items, {
+            text = _("\u{EA2D} Push"),
+            callback = function()
+                if not NetworkMgr:isOnline() then
+                    NetworkMgr:promptWifiOn(function()
+                        local ok, err = GitOps.push(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                        UIManager:show(InfoMessage:new{
+                            text = ok and _("Pushed!") or ("Push failed: " .. (err or "?")),
+                            timeout = ok and 3 or 5,
+                        })
+                    end)
+                    return
+                end
+                local ok, err = GitOps.push(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                UIManager:show(InfoMessage:new{
+                    text = ok and _("Pushed!") or ("Push failed: " .. (err or "?")),
+                    timeout = ok and 3 or 5,
+                })
+            end,
+        })
+
+        table.insert(items, {
+            text = _("\u{EA2C} Sync"),
+            callback = function()
+                local function doSync()
+                    local token = GitNotesSettings.getTokenForRepo(full_name)
+                    local loading = InfoMessage:new{ text = _("Syncing..."), timeout = 120 }
+                    UIManager:show(loading)
+                    UIManager:forceRePaint()
+                    local ok, msg = SyncEngine.sync(repo_path, token, branch)
+                    UIManager:close(loading)
+                    UIManager:show(InfoMessage:new{ text = msg, timeout = ok and 3 or 5 })
+                    GitNotesSettings.updateSyncInfo(full_name, "")
+                end
+                if not NetworkMgr:isOnline() then
+                    NetworkMgr:promptWifiOn(doSync)
+                    return
+                end
+                doSync()
+            end,
+        })
+
+        table.insert(items, {
+            text = _("\u{EBCD} Commit"),
+            callback = function() BrowserUI.promptCommit(full_name, repo_info, on_close) end,
+        })
+
+        table.insert(items, {
+            text = _("\u{F017} Recent Changes"),
+            callback = function() BrowserUI.showRecentChanges(full_name, repo_info, on_close) end,
+        })
+
+        table.insert(items, {
+            text = _("\u{F414} Search files"),
+            callback = function()
+                BrowserUI.promptLocalSearch(repo_path, full_name, repo_info, on_close)
+            end,
+        })
+
+        local cur_token = GitNotesSettings.getRepoTokens()[full_name] or _("Not set")
+        table.insert(items, {
+            text = _("\u{E60A} Change Token"),
+            mandatory = cur_token,
+            callback = function(menu)
+                UIManager:close(menu)
+                BrowserUI.showTokenSelectMenu(owner, repo, on_close)
+            end,
+        })
+
+        table.insert(items, {
+            text = _("\u{ECE7} Detach local copy"),
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = string.format(_("Detach local copy of \"%s\"?\n\nDirectory: %s\n\nThe remote bookmark will be preserved."), full_name, repo_path),
+                    ok_text = _("Detach"),
+                    ok_callback = function()
+                        os.execute(string.format("rm -rf %q", repo_path))
+                        GitNotesSettings.removeRepoInfo(full_name)
+                        UIManager:show(InfoMessage:new{ text = _("Detached."), timeout = 2 })
+                        if on_close then on_close() end
+                    end,
+                })
+            end,
+        })
+    else
+        local parent = path:match("^(.+)/[^/]+$") or ""
+        table.insert(items, {
+            text = "\u{ED22} ..",
+            callback = function(menu) UIManager:close(menu) end,
+        })
+    end
+
+    -- List directory contents
+    local full_path = repo_path
+    if path and path ~= "" then full_path = repo_path .. "/" .. path end
+
+    local dir_attr = lfs.attributes(full_path)
+    if not dir_attr or dir_attr.mode ~= "directory" then
+        UIManager:show(InfoMessage:new{ text = _("Cannot read directory: ") .. (full_path or "?"), timeout = 3 })
+        return
+    end
+
+    local ok_iter, iter, dir_obj = pcall(lfs.dir, full_path)
+    if not ok_iter or not iter then
+        UIManager:show(InfoMessage:new{ text = _("Cannot list directory: ") .. full_path, timeout = 3 })
+        return
+    end
+
+    local dirs, files = {}, {}
+    for entry in iter, dir_obj do
+        if entry ~= "." and entry ~= ".." then
+            local entry_path = full_path .. "/" .. entry
+            local attr = lfs.attributes(entry_path)
+            if attr and not IgnoreEngine.shouldIgnore(entry) then
+                if attr.mode == "directory" then
+                    table.insert(dirs, { name = entry, path = (path ~= "" and path .. "/" or "") .. entry, attr = attr })
+                else
+                    table.insert(files, { name = entry, path = (path ~= "" and path .. "/" or "") .. entry, attr = attr })
+                end
+            end
+        end
+    end
+    table.sort(dirs, function(a, b) return a.name:lower() < b.name:lower() end)
+    table.sort(files, function(a, b) return a.name:lower() < b.name:lower() end)
+
+    if #items > 0 then
+        table.insert(items, { text = "────────────────────", callback = function() end })
+    end
+
+    for _, d in ipairs(dirs) do
+        table.insert(items, {
+            text = "\u{E94A} " .. d.name .. "/",
+            callback = function()
+                BrowserUI.openAttachedRepo(full_name, repo_info, d.path, branch, on_close)
+            end,
+        })
+    end
+
+    for _, f in ipairs(files) do
+        table.insert(items, {
+            text = "\u{F016} " .. f.name,
+            mandatory = GitNotesAPI.formatSize(f.attr.size),
+            callback = function()
+                BrowserUI.openLocalFile(full_name, repo_info, f.path, f.name, branch, on_close)
+            end,
+            hold_callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = string.format(_("Delete \"%s\"?"), f.name),
+                    ok_text = _("Delete"),
+                    ok_callback = function()
+                        local fpath = repo_path .. "/" .. f.path
+                        os.remove(fpath)
+                        UIManager:show(InfoMessage:new{ text = _("Deleted."), timeout = 2 })
+                        BrowserUI.openAttachedRepo(full_name, repo_info, path, branch, on_close)
+                    end,
+                })
+            end,
+        })
+    end
+
+    local title = is_root and ("local: " .. repo .. " [" .. branch .. "]") or (repo .. "/" .. path)
+    UIManager:show(BrowserMenu:new{ title = title, item_table = items, on_close = is_root and on_close or nil })
+end
+
+function BrowserUI.openLocalFile(full_name, repo_info, rel_path, name, branch, on_close)
+    local full_path = repo_info.local_path .. "/" .. rel_path
+
+    if isTextFile(name) then
+        Editor.openFile(full_path)
+    else
+        UIManager:show(ConfirmBox:new{
+            text = string.format(_("File: %s\n\nThis file type cannot be edited inline.\nCopy to download folder?"), name),
+            ok_text = _("Copy"),
+            ok_callback = function()
+                local dl_dir = GitNotesSettings.getDownloadDir()
+                ensureDir(dl_dir)
+                local dest = dl_dir .. "/" .. name
+                local src_f = io.open(full_path, "rb")
+                if not src_f then
+                    UIManager:show(InfoMessage:new{ text = _("Cannot read file."), timeout = 3 })
+                    return
+                end
+                local data = src_f:read("*a")
+                src_f:close()
+                local dst_f = io.open(dest, "wb")
+                if dst_f then
+                    dst_f:write(data)
+                    dst_f:close()
+                    UIManager:show(InfoMessage:new{ text = _("Copied to: ") .. dest, timeout = 4 })
+                end
+            end,
+        })
+    end
+end
+
+function BrowserUI.promptCommit(full_name, repo_info, on_close)
+    if not GitOps.hasChanges(repo_info.local_path) then
+        UIManager:show(InfoMessage:new{ text = _("Nothing to commit."), timeout = 3 })
+        return
+    end
+    local dlg
+    dlg = InputDialog:new{
+        title = _("Commit message"),
+        input = "",
+        input_hint = _("What changed?"),
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Commit"), is_enter_default = true, callback = function()
+                local msg = dlg:getInputText():match("^%s*(.-)%s*$")
+                UIManager:close(dlg)
+                if msg == "" then msg = "Update" end
+                local ok, err = GitOps.commit(repo_info.local_path, msg)
+                UIManager:show(InfoMessage:new{
+                    text = ok and _("Committed!") or ("Commit failed: " .. (err or "?")),
+                    timeout = ok and 3 or 5,
+                })
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+function BrowserUI.showRecentChanges(full_name, repo_info, on_close)
+    local repo_path = repo_info.local_path
+    local branch = repo_info.branch or GitOps.getCurrentBranch(repo_path) or "main"
+    local items = {}
+
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu)
+            UIManager:close(menu)
+            local o, r = full_name:match("^([^/]+)/(.+)$")
+            if o then BrowserUI.openRepo(o, r, nil, branch, on_close) end
+        end,
+    })
+
+    -- Remote changes
+    local remote_changes = SyncEngine.getRemoteChanges(repo_path, branch, 10)
+    table.insert(items, { text = "── " .. _("Remote (new)") .. " ──", callback = function() end })
+    if #remote_changes == 0 then
+        table.insert(items, { text = _("   None"), callback = function() end })
+    else
+        for _, entry in ipairs(remote_changes) do
+            table.insert(items, {
+                text = entry.hash .. " " .. entry.message,
+                mandatory = entry.date,
+                callback = function() end,
+            })
+        end
+    end
+
+    -- Uncommitted
+    local uncommitted = SyncEngine.getUncommitted(repo_path)
+    table.insert(items, { text = "── " .. _("Uncommitted") .. " ──", callback = function() end })
+    if #uncommitted == 0 then
+        table.insert(items, { text = _("   None"), callback = function() end })
+    else
+        for _, entry in ipairs(uncommitted) do
+            table.insert(items, {
+                text = entry.status .. " " .. entry.file,
+                callback = function() end,
+            })
+        end
+    end
+
+    -- Unpushed
+    local unpushed = SyncEngine.getLocalUnpushed(repo_path, branch, 10)
+    table.insert(items, { text = "── " .. _("Unpushed") .. " ──", callback = function() end })
+    if #unpushed == 0 then
+        table.insert(items, { text = _("   None"), callback = function() end })
+    else
+        for _, entry in ipairs(unpushed) do
+            table.insert(items, {
+                text = entry.hash .. " " .. entry.message,
+                mandatory = entry.date,
+                callback = function() end,
+            })
+        end
+    end
+
+    -- Actions
+    table.insert(items, { text = "────────────────────", callback = function() end })
+    table.insert(items, {
+        text = _("\u{EA2E} Pull"),
+        callback = function()
+            if not NetworkMgr:isOnline() then
+                NetworkMgr:promptWifiOn(function()
+                    local ok, err = GitOps.pull(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                    UIManager:show(InfoMessage:new{
+                        text = ok and _("Pulled!") or ("Pull failed: " .. (err or "?")),
+                        timeout = ok and 3 or 5,
+                    })
+                    BrowserUI.showRecentChanges(full_name, repo_info, on_close)
+                end)
+                return
+            end
+            local ok, err = GitOps.pull(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+            UIManager:show(InfoMessage:new{
+                text = ok and _("Pulled!") or ("Pull failed: " .. (err or "?")),
+                timeout = ok and 3 or 5,
+            })
+            BrowserUI.showRecentChanges(full_name, repo_info, on_close)
+        end,
+    })
+    table.insert(items, {
+        text = _("\u{EA2D} Push"),
+        callback = function()
+            if not NetworkMgr:isOnline() then
+                NetworkMgr:promptWifiOn(function()
+                    local ok, err = GitOps.push(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+                    UIManager:show(InfoMessage:new{
+                        text = ok and _("Pushed!") or ("Push failed: " .. (err or "?")),
+                        timeout = ok and 3 or 5,
+                    })
+                    BrowserUI.showRecentChanges(full_name, repo_info, on_close)
+                end)
+                return
+            end
+            local ok, err = GitOps.push(repo_path, GitNotesSettings.getTokenForRepo(full_name))
+            UIManager:show(InfoMessage:new{
+                text = ok and _("Pushed!") or ("Push failed: " .. (err or "?")),
+                timeout = ok and 3 or 5,
+            })
+            BrowserUI.showRecentChanges(full_name, repo_info, on_close)
+        end,
+    })
+    table.insert(items, {
+        text = _("\u{F314} View Diff"),
+        callback = function()
+            local diff = GitOps.diff(repo_path)
+            if diff and diff ~= "" then
+                UIManager:show(TextViewer:new{
+                    title = _("Diff"),
+                    text = #diff > 30000 and diff:sub(1, 30000) .. "\n\n── [ truncated ] ──" or diff,
+                    height = math.floor(Screen:getHeight() * 0.85),
+                })
+            else
+                UIManager:show(InfoMessage:new{ text = _("No uncommitted changes."), timeout = 3 })
+            end
+        end,
+    })
+    table.insert(items, {
+        text = _("\u{F017} Git Log"),
+        callback = function()
+            local log_entries = GitOps.log(repo_path, 20)
+            if not log_entries or #log_entries == 0 then
+                UIManager:show(InfoMessage:new{ text = _("No commits yet."), timeout = 3 })
+                return
+            end
+            local log_items = {}
+            table.insert(log_items, {
+                text = "\u{ED0B} Back",
+                callback = function(m) UIManager:close(m); BrowserUI.showRecentChanges(full_name, repo_info, on_close) end,
+            })
+            for _, e in ipairs(log_entries) do
+                table.insert(log_items, {
+                    text = e.hash .. " " .. e.message,
+                    mandatory = e.date,
+                    callback = function() end,
+                })
+            end
+            UIManager:show(BrowserMenu:new{ title = _("Git Log"), item_table = log_items })
+        end,
+    })
+
+    UIManager:show(BrowserMenu:new{
+        title = _("Changes: ") .. full_name,
+        item_table = items,
+    })
+end
+
+function BrowserUI.promptLocalSearch(repo_path, full_name, repo_info, on_close)
+    local dlg
+    dlg = InputDialog:new{
+        title = _("Search files"),
+        input = "",
+        buttons = {{
+            { text = _("Cancel"), callback = function() UIManager:close(dlg) end },
+            { text = _("Search"), is_enter_default = true, callback = function()
+                local query = dlg:getInputText():match("^%s*(.-)%s*$")
+                UIManager:close(dlg)
+                if query == "" then return end
+                BrowserUI.doLocalSearch(repo_path, full_name, repo_info, query, on_close)
+            end },
+        }},
+    }
+    UIManager:show(dlg)
+    dlg:onShowKeyboard()
+end
+
+function BrowserUI.doLocalSearch(repo_path, full_name, repo_info, query, on_close)
+    local results = {}
+    local q_lower = query:lower()
+
+    local function walk(dir, prefix)
+        local ok_iter, iter, dir_obj = pcall(lfs.dir, dir)
+        if not ok_iter or not iter then return end
+        for entry in iter, dir_obj do
+            if entry ~= "." and entry ~= ".." and not IgnoreEngine.shouldIgnore(entry) then
+                local full = dir .. "/" .. entry
+                local rel = prefix ~= "" and (prefix .. "/" .. entry) or entry
+                local attr = lfs.attributes(full)
+                if attr then
+                    if attr.mode == "directory" then
+                        walk(full, rel)
+                    elseif entry:lower():find(q_lower, 1, true) then
+                        table.insert(results, { name = entry, path = rel })
+                    end
+                end
+            end
+        end
+    end
+
+    walk(repo_path, "")
+
+    local items = {}
+    table.insert(items, {
+        text = "\u{ED0B} Back",
+        callback = function(menu)
+            UIManager:close(menu)
+            local owner, repo = full_name:match("^([^/]+)/(.+)$")
+            BrowserUI.openAttachedRepo(full_name, repo_info, nil, nil, on_close)
+        end,
+    })
+
+    for _, r in ipairs(results) do
+        table.insert(items, {
+            text = r.path,
+            callback = function()
+                local owner, repo = full_name:match("^([^/]+)/(.+)$")
+                BrowserUI.openLocalFile(full_name, repo_info, r.path, r.name, nil, on_close)
+            end,
+        })
+    end
+
+    if #items == 1 then
+        table.insert(items, { text = _("   No results."), callback = function() end })
+    end
+
+    UIManager:show(BrowserMenu:new{ title = _("Results: ") .. query, item_table = items })
+end
+
+BrowserUI._sync_checked = {}
+
+return BrowserUI
