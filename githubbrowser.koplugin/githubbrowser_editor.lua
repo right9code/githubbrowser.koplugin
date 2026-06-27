@@ -104,14 +104,19 @@ function Editor.openFile(file_path, caller_callback, remote_origin)
                 end
                 local GitOps = require("githubbrowser_git")
                 local rel = file_path:sub(#git_repo_root + 2)
-                os.execute(string.format("cd %q && git add %q 2>/dev/null", git_repo_root, rel))
+
+                local loading = InfoMessage:new{ text = _("Committing..."), timeout = 60 }
+                UIManager:show(loading)
+                UIManager:forceRePaint()
+
                 local device = GithubBrowserSettings.getDeviceName() or "koreader"
                 local msg = "Edit " .. rel .. " from " .. device
-                local c_ok = GitOps.commit(git_repo_root, msg)
+                local c_ok, c_err = GitOps.syncSingleFile(git_repo_root, rel, msg)
+                UIManager:close(loading)
                 if c_ok then
-                    UIManager:show(InfoMessage:new{ text = _("Committed!"), timeout = 2 })
+                    UIManager:show(InfoMessage:new{ text = _("Committed & pushed!"), timeout = 2 })
                 else
-                    UIManager:show(InfoMessage:new{ text = _("Nothing to commit or commit failed."), timeout = 4 })
+                    UIManager:show(InfoMessage:new{ text = _("Commit failed: ") .. (c_err or "?"), timeout = 4 })
                 end
             end,
         }

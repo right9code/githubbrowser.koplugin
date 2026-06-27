@@ -1,4 +1,5 @@
-local Menu         = require("ui/widget/menu")
+loo all lua check??
+al Menu         = require("ui/widget/menu")
 local Font         = require("ui/font")
 local InputDialog  = require("ui/widget/inputdialog")
 local TextViewer   = require("ui/widget/textviewer")
@@ -265,12 +266,8 @@ function BrowserUI.promptAddLocalFolder()
                         -- Check if it's a git repo
                         local is_git = GitOps.isGitRepo(path)
                         local branch = nil
-                        local hash = ""
                         if is_git then
                             branch = GitOps.getCurrentBranch(path) or "main"
-                            local handle = io.popen(string.format("cd %q && git rev-parse HEAD 2>&1", path))
-                            hash = handle and handle:read("*a"):gsub("%s+$", "") or ""
-                            if handle then handle:close() end
                         end
                         -- Register as attached local folder
                         GithubBrowserSettings.setRepoInfo(label, {
@@ -278,7 +275,6 @@ function BrowserUI.promptAddLocalFolder()
                             local_path     = path,
                             branch         = branch,
                             is_git         = is_git,
-                            last_sync_hash = hash,
                             last_sync_time = os.time(),
                         })
                         local msg = is_git
@@ -1513,9 +1509,8 @@ function BrowserUI._doClone(owner, repo, branch, dest, on_close)
     UIManager:show(loading)
     UIManager:forceRePaint()
 
-    local url = "https://github.com/" .. owner .. "/" .. repo .. ".git"
-    local shallow = GithubBrowserSettings.getShallowCloneDefault()
-    local ok, output = GitOps.clone(url, dest, token, shallow)
+    local url = "https://github.com/" .. owner .. "/" .. repo
+    local ok, output = GitOps.clone(url, dest, token)
 
     UIManager:close(loading)
 
@@ -1524,16 +1519,10 @@ function BrowserUI._doClone(owner, repo, branch, dest, on_close)
         return
     end
 
-    -- Get current HEAD hash for sync tracking
-    local handle = io.popen(string.format("cd %q && git rev-parse HEAD 2>&1", dest))
-    local hash = handle and handle:read("*a"):gsub("%s+$", "") or ""
-    if handle then handle:close() end
-
     GithubBrowserSettings.setRepoInfo(full_name, {
         mode           = "attached",
         local_path     = dest,
         branch         = branch or GitOps.getCurrentBranch(dest) or "main",
-        last_sync_hash = hash,
         last_sync_time = os.time(),
     })
 

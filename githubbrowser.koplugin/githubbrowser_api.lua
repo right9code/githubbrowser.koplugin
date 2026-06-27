@@ -307,4 +307,112 @@ function GithubBrowserAPI.deleteDirectory(owner, repo, path, branch, message, to
     return true, nil
 end
 
+-- ── Git API methods (pure Lua, no git CLI needed) ───────────────────────────
+
+function GithubBrowserAPI.getBranches(owner, repo, token)
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/branches?per_page=100"
+    return makeRequest(url)
+end
+
+function GithubBrowserAPI.getCommits(owner, repo, ref, count, token)
+    ref = ref or "main"
+    count = count or 20
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo
+              .. "/commits?sha=" .. urlEncodeQuery(ref) .. "&per_page=" .. tostring(count)
+    return makeRequest(url)
+end
+
+function GithubBrowserAPI.getRemoteHead(owner, repo, ref, token)
+    ref = ref or "main"
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo
+              .. "/git/ref/heads/" .. urlEncodePath(ref)
+    local data, err = makeRequest(url)
+    if not data then return nil, err end
+    if data.object and data.object.sha then
+        return data.object.sha
+    end
+    return nil, "Unexpected response"
+end
+
+function GithubBrowserAPI.createBlob(owner, repo, content, token)
+    if not token or token == "" then return nil, "Token required" end
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/git/blobs"
+    local body = {
+        encoding = "base64",
+        content  = b64encode(content),
+    }
+    return curlRequest(url, "POST", json_encode(body), token)
+end
+
+function GithubBrowserAPI.createTree(owner, repo, base_tree_sha, tree_entries, token)
+    if not token or token == "" then return nil, "Token required" end
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/git/trees"
+    local body = {
+        base_tree = base_tree_sha,
+        tree      = tree_entries,
+    }
+    return curlRequest(url, "POST", json_encode(body), token)
+end
+
+function GithubBrowserAPI.createCommit(owner, repo, message, tree_sha, parent_sha, token)
+    if not token or token == "" then return nil, "Token required" end
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/git/commits"
+    local body = {
+        message = message,
+        tree    = tree_sha,
+    }
+    if parent_sha then
+        body.parents = { parent_sha }
+    end
+    return curlRequest(url, "POST", json_encode(body), token)
+end
+
+function GithubBrowserAPI.updateRef(owner, repo, ref, sha, token)
+    if not token or token == "" then return nil, "Token required" end
+    local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo
+              .. "/git/refs/heads/" .. urlEncodePath(ref)
+    local body = {
+        sha   = sha,
+        force = false,
+    }
+    return curlRequest(url, "PATCH", json_encode(body), token)
+end
+
+local function ensureDir(path)
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(path, "mode") then return true end
+    local parent = path:match("^(.+)/[^/]+$")
+    if parent then ensureDir(parent) end
+    return lfs.mkdir(path) == 0
+end
+
+function GithubBrowserAPI.downloadTree(owner, repo, ref, token, dest_path)
+    local data, err = GithubBrowserAPI.getTree(owner, repo, ref)
+    if not data then return nil, err end
+    if not data.tree then return nil, "No tree in response" end
+
+    ensureDir(dest_path)
+    local downloaded = 0
+    local total = #data.tree
+    for _, entry in ipairs(data.tree) do
+        if entry.type == "blob" and entry.sha then
+            local file_url = "https://raw.githubusercontent.com/" .. owner .. "/" .. repo
+                           .. "/" .. (ref or "main") .. "/" .. entry.path
+            local file_data, ferr = fetchRaw(file_url)
+            if file_data then
+                local full_path = dest_path .. "/" .. entry.path
+                local dir = full_path:match("^(.+)/[^/]+$")
+                if dir then ensureDir(dir) end
+                local fh = io.open(full_path, "wb")
+                if fh then
+                    fh:write(file_data)
+                    fh:close()
+                end
+            end
+            downloaded = downloaded + 1
+        end
+    end
+    return downloaded, nil
+end
+
 return GithubBrowserAPI

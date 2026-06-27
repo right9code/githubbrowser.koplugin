@@ -1,202 +1,577 @@
+-- Pure Lua git operations via GitHub API (no git CLI required)
 local logger = require("logger")
 local lfs    = require("libs/libkoreader-lfs")
+local json   = require("json")
 
 local GithubBrowserSettings = require("githubbrowser_settings")
+local GithubBrowserAPI      = require("githubbrowser_api")
 
 local GitOps = {}
 
--- ── Core execution helper ─────────────────────────────────────────────────────
+local META_FILE = ".ghbrowser.json"
 
-local function gitExec(args, cwd)
-    local cmd = "git " .. args
-    if cwd then
-        cmd = string.format("cd %q && %s", cwd, cmd)
+-- ── Helpers ──────────────────────────────────────────────────────────────────
+
+local function ensureDir(path)
+    if lfs.attributes(path, "mode") then return true end
+    local parent = path:match("^(.+)/[^/]+$")
+    if parent then ensureDir(parent) end
+    return lfs.mkdir(path) == 0
+end
+
+local function removeDir(path)
+    local ok_iter, iter, dir_obj = pcall(lfs.dir, path)
+    if not ok_iter then return end
+    for entry in iter, dir_obj do
+        if entry ~= "." and entry ~= ".." then
+            local full = path .. "/" .. entry
+            local attr = lfs.attributes(full)
+            if attr and attr.mode == "directory" then
+                removeDir(full)
+            else
+                os.remove(full)
+            end
+        end
     end
-    logger.dbg("GitOps: " .. cmd)
-    local handle = io.popen(cmd .. " 2>&1")
-    if not handle then return nil, false, -1 end
-    local output = handle:read("*a")
-    local ok, _, exitcode = handle:close()
-    return (output or ""):gsub("%s+$", ""), ok, exitcode
+    lfs.rmdir(path)
 end
 
-local function shellEscape(str)
-    return "'" .. str:gsub("'", "'\\''") .. "'"
+local function readFile(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local content = f:read("*a")
+    f:close()
+    return content
 end
 
--- ── Auth helper ───────────────────────────────────────────────────────────────
+local function writeFile(path, content)
+    local dir = path:match("^(.+)/[^/]+$")
+    if dir then ensureDir(dir) end
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(content)
+    f:close()
+    return true
+end
 
-local function withAuth(repo_path, token, fn)
-    if not token or token == "" then return fn() end
-    local clean_url = GitOps.getRemoteUrl(repo_path)
-    if not clean_url then return fn() end
-    local auth_url = clean_url:gsub("https://", "https://" .. token .. "@")
-    gitExec("remote set-url origin " .. auth_url, repo_path)
-    local results = {fn()}
-    gitExec("remote set-url origin " .. clean_url, repo_path)
-    return unpack(results)
+local function hashContent(content)
+    if not content or #content == 0 then return "e69de29" end
+    local len = #content
+    local sum = 0
+    local step = math.max(1, math.floor(len / 1024))
+    for i = 1, len, step do
+        sum = (sum + content:byte(i)) % 0xFFFFFFFF
+    end
+    return string.format("%08x_%d", sum, len)
+end
+
+local function hashFile(path)
+    local content = readFile(path)
+    if not content then return nil end
+    return hashContent(content)
+end
+
+local function readMeta(repo_path)
+    local content = readFile(repo_path .. "/" .. META_FILE)
+    if not content then return nil end
+    local ok, data = pcall(json.decode, content)
+    return ok and data or nil
+end
+
+local function writeMeta(repo_path, meta)
+    return writeFile(repo_path .. "/" .. META_FILE, json.encode(meta))
+end
+
+-- Walk directory collecting all files (excluding meta/git files)
+local function walkFiles(dir, prefix, result)
+    local ok_iter, iter, dir_obj = pcall(lfs.dir, dir)
+    if not ok_iter then return end
+    for entry in iter, dir_obj do
+        if entry ~= "." and entry ~= ".." and entry ~= ".git"
+           and entry ~= META_FILE and entry ~= ".gitignore" then
+            local full = dir .. "/" .. entry
+            local rel = prefix ~= "" and (prefix .. "/" .. entry) or entry
+            local attr = lfs.attributes(full)
+            if attr then
+                if attr.mode == "directory" then
+                    walkFiles(full, rel, result)
+                else
+                    result[rel] = full
+                end
+            end
+        end
+    end
+end
+
+-- Parse owner/repo from URL or remote_url
+local function parseOwnerRepo(url)
+    if not url then return nil, nil end
+    local owner, repo = url:match("github%.com/([^/]+)/([^/]+)")
+    if owner then
+        repo = repo:gsub("%.git$", "")
+        return owner, repo
+    end
+    return nil, nil
 end
 
 -- ── Detection ─────────────────────────────────────────────────────────────────
 
 function GitOps.isAvailable()
-    local handle = io.popen("git --version 2>&1")
-    if not handle then return false end
-    local output = handle:read("*a")
-    handle:close()
-    return output and output:match("git version") ~= nil
+    return true  -- No git binary needed
 end
 
 function GitOps.isGitRepo(path)
     if not path then return false end
-    local output, ok = gitExec("rev-parse --is-inside-work-tree", path)
-    return ok and output:find("true") ~= nil
-end
-
--- ── Clone ─────────────────────────────────────────────────────────────────────
-
-function GitOps.clone(url, dest, token, shallow)
-    local clone_url = url
-    if token and token ~= "" then
-        clone_url = url:gsub("https://", "https://" .. token .. "@")
-    end
-
-    local depth_flag = shallow and " --depth 1" or ""
-    local cmd = string.format("clone%s %q %q 2>&1", depth_flag, clone_url, dest)
-    local output, ok = gitExec(cmd)
-
-    if ok then
-        gitExec("remote set-url origin " .. url, dest)
-    end
-
-    return ok, output, dest
-end
-
--- ── Remote operations ─────────────────────────────────────────────────────────
-
-function GitOps.fetch(repo_path, token)
-    return withAuth(repo_path, token, function()
-        local output, ok = gitExec("fetch origin 2>&1", repo_path)
-        return ok, output
-    end)
-end
-
-function GitOps.pull(repo_path, token)
-    return withAuth(repo_path, token, function()
-        local output, ok = gitExec("pull --ff-only 2>&1", repo_path)
-        return ok, output
-    end)
-end
-
-function GitOps.push(repo_path, token)
-    return withAuth(repo_path, token, function()
-        local branch = GitOps.getCurrentBranch(repo_path) or "main"
-        local output, ok = gitExec("push origin " .. branch .. " 2>&1", repo_path)
-        return ok, output
-    end)
-end
-
--- ── Local operations ──────────────────────────────────────────────────────────
-
-function GitOps.commit(repo_path, message)
-    local _, ok1 = gitExec("add -A", repo_path)
-    if not ok1 then return false, "Failed to stage changes" end
-
-    local device = GithubBrowserSettings.getDeviceName()
-    local full_msg = message .. "\n\nFrom: " .. device
-    local output, ok2 = gitExec("commit -m " .. shellEscape(full_msg), repo_path)
-    if not ok2 then return false, "Nothing to commit or commit failed.\n" .. output end
-    return true, output
-end
-
-function GitOps.status(repo_path)
-    local output, ok = gitExec("status --porcelain", repo_path)
-    if not ok then return nil, "Failed to get status" end
-    local files = {}
-    for line in output:gmatch("[^\r\n]+") do
-        local status = line:sub(1, 2)
-        local file = line:sub(4)
-        files[#files + 1] = { status = status, file = file }
-    end
-    return files
-end
-
-function GitOps.hasChanges(repo_path)
-    local files, err = GitOps.status(repo_path)
-    if not files then return false end
-    return #files > 0
-end
-
-function GitOps.log(repo_path, count)
-    count = count or 20
-    local output, ok = gitExec(
-        "log --oneline --format='%h|%s|%an|%ar' -" .. count,
-        repo_path
-    )
-    if not ok then return nil, "Failed to get log" end
-    local entries = {}
-    for line in output:gmatch("[^\r\n]+") do
-        local hash, msg, author, date = line:match("^(%w+)|(.+)|(.+)|(.+)$")
-        if hash then
-            entries[#entries + 1] = {
-                hash    = hash,
-                message = msg,
-                author  = author,
-                date    = date,
-            }
-        end
-    end
-    return entries
-end
-
-function GitOps.diff(repo_path)
-    local output, ok = gitExec("diff", repo_path)
-    if not ok then return nil, "Failed to get diff" end
-    return output
-end
-
-function GitOps.getCurrentBranch(repo_path)
-    local output, ok = gitExec("branch --show-current", repo_path)
-    if not ok then return nil end
-    return output ~= "" and output or nil
-end
-
-function GitOps.listBranches(repo_path)
-    local output, ok = gitExec("branch -a", repo_path)
-    if not ok then return nil, "Failed to list branches" end
-    local branches = {}
-    for line in output:gmatch("[^\r\n]+") do
-        local is_current = line:sub(1, 1) == "*"
-        local name = line:gsub("^%*?%s+", ""):match("^%s*(.-)%s*$")
-        if name and name ~= "" then
-            branches[#branches + 1] = { name = name, is_current = is_current }
-        end
-    end
-    return branches
-end
-
-function GitOps.checkout(repo_path, branch)
-    local output, ok = gitExec("checkout " .. shellEscape(branch), repo_path)
-    return ok, output
+    return lfs.attributes(path .. "/" .. META_FILE, "mode") ~= nil
 end
 
 function GitOps.getRemoteUrl(repo_path)
-    local output, ok = gitExec("remote get-url origin", repo_path)
-    if not ok then return nil end
-    return output ~= "" and output or nil
+    local meta = readMeta(repo_path)
+    if meta and meta.remote_url then return meta.remote_url end
+    if meta and meta.owner and meta.repo then
+        return "https://github.com/" .. meta.owner .. "/" .. meta.repo
+    end
+    return nil
 end
 
-function GitOps.hasLocalCommits(repo_path)
-    local branch = GitOps.getCurrentBranch(repo_path)
-    if not branch then return false end
-    local output, ok = gitExec("log --oneline origin/" .. branch .. "..HEAD", repo_path)
-    if not ok then return false end
-    return output:gsub("%s+", "") ~= ""
+function GitOps.getCurrentBranch(repo_path)
+    local meta = readMeta(repo_path)
+    return meta and meta.branch or nil
 end
 
 function GitOps.getLocalPath(owner, repo)
     local workspace = GithubBrowserSettings.getWorkspace()
     return workspace .. "/" .. repo
+end
+
+-- ── Clone (download entire repo via GitHub API) ──────────────────────────────
+
+function GitOps.clone(url, dest, token, shallow)
+    local owner, repo = parseOwnerRepo(url)
+    if not owner or not repo then
+        return false, "Invalid GitHub URL: " .. tostring(url)
+    end
+
+    -- Get repo info for default branch
+    local repo_info, err = GithubBrowserAPI.getRepo(owner, repo)
+    if not repo_info then
+        return false, "Failed to get repo info: " .. (err or "?")
+    end
+    local branch = repo_info.default_branch or "main"
+
+    -- Get remote HEAD sha
+    local remote_sha = GithubBrowserAPI.getRemoteHead(owner, repo, branch)
+
+    -- Download all files via raw content URLs
+    local tree_data, tree_err = GithubBrowserAPI.getTree(owner, repo, branch)
+    if not tree_data or not tree_data.tree then
+        return false, "Failed to get repo tree: " .. (tree_err or "?")
+    end
+
+    ensureDir(dest)
+    local snapshot = {}
+    local downloaded = 0
+    local files_to_get = {}
+    for _, entry in ipairs(tree_data.tree) do
+        if entry.type == "blob" then
+            files_to_get[#files_to_get + 1] = entry
+        end
+    end
+
+    for _, entry in ipairs(files_to_get) do
+        local raw_url = "https://raw.githubusercontent.com/" .. owner .. "/" .. repo
+                       .. "/" .. branch .. "/" .. entry.path
+        local file_data = GithubBrowserAPI.getRawFile(raw_url)
+        if file_data then
+            local full_path = dest .. "/" .. entry.path
+            writeFile(full_path, file_data)
+            snapshot[entry.path] = hashContent(file_data)
+            downloaded = downloaded + 1
+        end
+    end
+
+    -- Save metadata
+    local meta = {
+        owner         = owner,
+        repo          = repo,
+        branch        = branch,
+        remote_url    = "https://github.com/" .. owner .. "/" .. repo,
+        remote_head   = remote_sha or "",
+        snapshot      = snapshot,
+        unpushed      = {},
+    }
+    writeMeta(dest, meta)
+
+    logger.dbg("GitOps: cloned " .. owner .. "/" .. repo .. " (" .. downloaded .. " files)")
+    return true, "Cloned " .. downloaded .. " files", dest
+end
+
+-- ── Fetch (check remote head) ────────────────────────────────────────────────
+
+function GitOps.fetch(repo_path, token)
+    local meta = readMeta(repo_path)
+    if not meta then return false, "Not a repo" end
+
+    local remote_sha = GithubBrowserAPI.getRemoteHead(
+        meta.owner, meta.repo, meta.branch
+    )
+    if not remote_sha then return false, "Could not reach remote" end
+
+    meta.remote_head = remote_sha
+    writeMeta(repo_path, meta)
+    return true, remote_sha
+end
+
+function GitOps.fetchRemoteHead(repo_path)
+    local meta = readMeta(repo_path)
+    if not meta then return nil end
+    return GithubBrowserAPI.getRemoteHead(meta.owner, meta.repo, meta.branch)
+end
+
+-- ── Pull (download changes from remote) ──────────────────────────────────────
+
+function GitOps.pull(repo_path, token)
+    local meta = readMeta(repo_path)
+    if not meta then return false, "Not a repo" end
+
+    local remote_sha = GithubBrowserAPI.getRemoteHead(
+        meta.owner, meta.repo, meta.branch
+    )
+    if not remote_sha then return false, "Could not reach remote" end
+
+    if remote_sha == meta.remote_head then
+        return true, "Already up to date"
+    end
+
+    -- Get the new tree
+    local tree_data, tree_err = GithubBrowserAPI.getTree(meta.owner, meta.repo, meta.branch)
+    if not tree_data or not tree_data.tree then
+        return false, "Failed to get tree: " .. (tree_err or "?")
+    end
+
+    -- Build set of remote files
+    local remote_files = {}
+    for _, entry in ipairs(tree_data.tree) do
+        if entry.type == "blob" then
+            remote_files[entry.path] = entry.sha
+        end
+    end
+
+    -- Download new/changed files
+    local updated = 0
+    for path, remote_file_sha in pairs(remote_files) do
+        local local_hash = meta.snapshot[path]
+        -- Download if file is new or we don't have it tracked
+        if not local_hash then
+            local raw_url = "https://raw.githubusercontent.com/" .. meta.owner .. "/" .. meta.repo
+                           .. "/" .. meta.branch .. "/" .. path
+            local data = GithubBrowserAPI.getRawFile(raw_url)
+            if data then
+                writeFile(repo_path .. "/" .. path, data)
+                meta.snapshot[path] = hashContent(data)
+                updated = updated + 1
+            end
+        end
+    end
+
+    -- For files that exist locally but might have changed remotely,
+    -- re-download all tracked files (simple approach, reliable)
+    for _, entry in ipairs(tree_data.tree) do
+        if entry.type == "blob" then
+            local raw_url = "https://raw.githubusercontent.com/" .. meta.owner .. "/" .. meta.repo
+                           .. "/" .. meta.branch .. "/" .. entry.path
+            local data = GithubBrowserAPI.getRawFile(raw_url)
+            if data then
+                writeFile(repo_path .. "/" .. entry.path, data)
+                meta.snapshot[entry.path] = hashContent(data)
+            end
+        end
+    end
+
+    -- Remove files that no longer exist on remote
+    local local_files = {}
+    walkFiles(repo_path, "", local_files)
+    for rel_path, _ in pairs(local_files) do
+        if not remote_files[rel_path] then
+            os.remove(repo_path .. "/" .. rel_path)
+            meta.snapshot[rel_path] = nil
+        end
+    end
+
+    meta.remote_head = remote_sha
+    meta.unpushed = {}
+    writeMeta(repo_path, meta)
+
+    return true, "Pulled latest changes"
+end
+
+-- ── Push (upload local changes via GitHub API) ───────────────────────────────
+
+function GitOps.push(repo_path, token)
+    if not token or token == "" then
+        return false, "GitHub token required to push"
+    end
+
+    local meta = readMeta(repo_path)
+    if not meta then return false, "Not a repo" end
+
+    -- Collect local changes vs snapshot
+    local local_files = {}
+    walkFiles(repo_path, "", local_files)
+
+    local tree_entries = {}
+    local has_changes = false
+
+    -- Check all local files
+    for rel_path, full_path in pairs(local_files) do
+        local local_hash = hashFile(full_path)
+        local snap_hash = meta.snapshot[rel_path]
+        if local_hash ~= snap_hash then
+            -- New or modified file - create blob
+            local content = readFile(full_path)
+            if content then
+                local blob, err = GithubBrowserAPI.createBlob(meta.owner, meta.repo, content, token)
+                if blob and blob.sha then
+                    tree_entries[#tree_entries + 1] = {
+                        path = rel_path,
+                        mode = "100644",
+                        type = "blob",
+                        sha  = blob.sha,
+                    }
+                    has_changes = true
+                else
+                    return false, "Failed to create blob for " .. rel_path .. ": " .. (err or "?")
+                end
+            end
+        end
+    end
+
+    -- Check for deleted files
+    for snap_path, _ in pairs(meta.snapshot) do
+        if not local_files[snap_path] then
+            tree_entries[#tree_entries + 1] = {
+                path = snap_path,
+                mode = "100644",
+                type = "blob",
+                sha  = nil,  -- nil sha = delete
+            }
+            has_changes = true
+        end
+    end
+
+    if not has_changes then
+        return true, "Nothing to push"
+    end
+
+    -- Get current remote head as parent
+    local remote_sha = GithubBrowserAPI.getRemoteHead(meta.owner, meta.repo, meta.branch)
+    if not remote_sha then
+        return false, "Could not get remote HEAD"
+    end
+
+    -- Create tree
+    local tree, tree_err = GithubBrowserAPI.createTree(meta.owner, meta.repo, remote_sha, tree_entries, token)
+    if not tree or not tree.sha then
+        return false, "Failed to create tree: " .. (tree_err or "?")
+    end
+
+    -- Create commit
+    local device = GithubBrowserSettings.getDeviceName()
+    local commit_msg = "Push from KOReader (" .. device .. ")"
+    local commit, commit_err = GithubBrowserAPI.createCommit(
+        meta.owner, meta.repo, commit_msg, tree.sha, remote_sha, token
+    )
+    if not commit or not commit.sha then
+        return false, "Failed to create commit: " .. (commit_err or "?")
+    end
+
+    -- Update ref
+    local ref_result, ref_err = GithubBrowserAPI.updateRef(
+        meta.owner, meta.repo, meta.branch, commit.sha, token
+    )
+    if not ref_result then
+        return false, "Failed to update ref: " .. (ref_err or "?")
+    end
+
+    -- Update local snapshot
+    for rel_path, full_path in pairs(local_files) do
+        meta.snapshot[rel_path] = hashFile(full_path)
+    end
+    for snap_path, _ in pairs(meta.snapshot) do
+        if not local_files[snap_path] then
+            meta.snapshot[snap_path] = nil
+        end
+    end
+    meta.remote_head = commit.sha
+    meta.unpushed = {}
+    writeMeta(repo_path, meta)
+
+    return true, "Pushed " .. #tree_entries .. " changes"
+end
+
+-- ── Commit (local staging for later push) ────────────────────────────────────
+
+function GitOps.commit(repo_path, message)
+    local meta = readMeta(repo_path)
+    if not meta then return false, "Not a repo" end
+
+    -- Check if there are actual changes
+    if not GitOps.hasChanges(repo_path) then
+        return false, "Nothing to commit"
+    end
+
+    local device = GithubBrowserSettings.getDeviceName()
+    local full_msg = message .. "\n\nFrom: " .. device
+
+    -- Record unpushed commit
+    meta.unpushed = meta.unpushed or {}
+    meta.unpushed[#meta.unpushed + 1] = {
+        message = full_msg,
+        date    = os.date("%Y-%m-%d %H:%M"),
+    }
+    writeMeta(repo_path, meta)
+
+    return true, "Committed locally (will push on next sync)"
+end
+
+-- ── Status ────────────────────────────────────────────────────────────────────
+
+function GitOps.status(repo_path)
+    local meta = readMeta(repo_path)
+    if not meta then return nil, "Not a repo" end
+
+    local local_files = {}
+    walkFiles(repo_path, "", local_files)
+
+    local files = {}
+    for rel_path, full_path in pairs(local_files) do
+        local local_hash = hashFile(full_path)
+        local snap_hash = meta.snapshot[rel_path]
+        if not snap_hash then
+            files[#files + 1] = { status = "A ", file = rel_path }
+        elseif local_hash ~= snap_hash then
+            files[#files + 1] = { status = "M ", file = rel_path }
+        end
+    end
+    for snap_path, _ in pairs(meta.snapshot) do
+        if not local_files[snap_path] then
+            files[#files + 1] = { status = "D ", file = snap_path }
+        end
+    end
+    return files
+end
+
+function GitOps.hasChanges(repo_path)
+    local files = GitOps.status(repo_path)
+    if not files then return false end
+    return #files > 0
+end
+
+-- ── Log (via GitHub API) ─────────────────────────────────────────────────────
+
+function GitOps.log(repo_path, count)
+    count = count or 20
+    local meta = readMeta(repo_path)
+    if not meta then return nil, "Not a repo" end
+
+    local commits, err = GithubBrowserAPI.getCommits(
+        meta.owner, meta.repo, meta.branch, count
+    )
+    if not commits then return nil, err end
+
+    local entries = {}
+    for _, c in ipairs(commits) do
+        local hash = c.sha and c.sha:sub(1, 7) or "?"
+        local msg = c.commit and c.commit.message or "?"
+        local author = c.commit and c.commit.author and c.commit.author.name or "?"
+        local date = c.commit and c.commit.author and c.commit.author.date or ""
+        -- Format date as relative
+        entries[#entries + 1] = {
+            hash    = hash,
+            message = msg:gsub("\n.*", ""),  -- first line only
+            author  = author,
+            date    = date:sub(1, 10),
+        }
+    end
+    return entries
+end
+
+-- ── Diff (local changes vs snapshot) ─────────────────────────────────────────
+
+function GitOps.diff(repo_path)
+    local meta = readMeta(repo_path)
+    if not meta then return nil, "Not a repo" end
+
+    local local_files = {}
+    walkFiles(repo_path, "", local_files)
+
+    local parts = {}
+    for rel_path, full_path in pairs(local_files) do
+        local local_hash = hashFile(full_path)
+        local snap_hash = meta.snapshot[rel_path]
+        if not snap_hash then
+            parts[#parts + 1] = "--- /dev/null"
+            parts[#parts + 1] = "+++ b/" .. rel_path
+            local content = readFile(full_path) or ""
+            for line in content:gmatch("[^\r\n]*") do
+                parts[#parts + 1] = "+" .. line
+            end
+        elseif local_hash ~= snap_hash then
+            parts[#parts + 1] = "--- a/" .. rel_path
+            parts[#parts + 1] = "+++ b/" .. rel_path
+            parts[#parts + 1] = "(file modified)"
+        end
+    end
+    for snap_path, _ in pairs(meta.snapshot) do
+        if not local_files[snap_path] then
+            parts[#parts + 1] = "--- a/" .. snap_path
+            parts[#parts + 1] = "+++ /dev/null"
+            parts[#parts + 1] = "(deleted)"
+        end
+    end
+
+    if #parts == 0 then return "" end
+    return table.concat(parts, "\n")
+end
+
+-- ── Branches (via GitHub API) ────────────────────────────────────────────────
+
+function GitOps.listBranches(repo_path)
+    local meta = readMeta(repo_path)
+    if not meta then return nil, "Not a repo" end
+
+    local branches_data, err = GithubBrowserAPI.getBranches(meta.owner, meta.repo)
+    if not branches_data then return nil, err end
+
+    local branches = {}
+    for _, b in ipairs(branches_data) do
+        branches[#branches + 1] = {
+            name        = b.name,
+            is_current  = (b.name == meta.branch),
+        }
+    end
+    return branches
+end
+
+function GitOps.checkout(repo_path, branch)
+    local meta = readMeta(repo_path)
+    if not meta then return false, "Not a repo" end
+
+    -- Update branch in metadata and re-download
+    meta.branch = branch
+    writeMeta(repo_path, meta)
+
+    -- Pull the new branch
+    local ok, msg = GitOps.pull(repo_path)
+    return ok, msg
+end
+
+-- ── Unpushed commits ─────────────────────────────────────────────────────────
+
+function GitOps.hasLocalCommits(repo_path)
+    local meta = readMeta(repo_path)
+    if not meta then return false end
+    return meta.unpushed and #meta.unpushed > 0
 end
 
 return GitOps

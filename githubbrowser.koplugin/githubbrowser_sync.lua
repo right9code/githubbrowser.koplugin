@@ -4,95 +4,65 @@ local GitOps = require("githubbrowser_git")
 local SyncEngine = {}
 
 function SyncEngine.checkStatus(repo_path, branch)
-    branch = branch or GitOps.getCurrentBranch(repo_path) or "main"
-
-    local local_hash = select(1, GitOps.getCurrentBranch(repo_path))
-    local _, fetch_ok = GitOps.fetch(repo_path)
-    if not fetch_ok then
+    -- Compare local snapshot hash vs remote HEAD hash
+    local local_ok = GitOps.fetch(repo_path)
+    if not local_ok then
         return "fetch_failed", "Could not reach remote."
     end
 
-    local local_h  = select(1,
-        (function() local o, ok = GitOps._rawExec and nil or nil; return select(1, (function()
-            local handle = io.popen(string.format("cd %q && git rev-parse HEAD 2>&1", repo_path))
-            local out = handle:read("*a"):gsub("%s+$", "")
-            handle:close()
-            return out
-        end)()) end)()
-    )
-
-    -- Use gitExec directly for hash comparison
-    local cmd_base = function(args)
-        local handle = io.popen(string.format("cd %q && git %s 2>&1", repo_path, args))
-        if not handle then return nil end
-        local out = handle:read("*a"):gsub("%s+$", "")
-        handle:close()
-        return out
+    local remote_sha = GitOps.fetchRemoteHead(repo_path)
+    if not remote_sha then
+        return "unknown", "Could not determine remote HEAD."
     end
 
-    local_h = cmd_base("rev-parse HEAD")
-    local remote_h = cmd_base("rev-parse origin/" .. branch)
+    local meta = GitOps._readMeta and GitOps._readMeta(repo_path)
+    -- Fall back: read meta directly
+    if not meta then
+        local lfs = require("libs/libkoreader-lfs")
+        local f = io.open(repo_path .. "/.ghbrowser.json", "r")
+        if not f then return "unknown", "Not a repo" end
+        local content = f:read("*a"); f:close()
+        local ok, data = pcall(require("json").decode, content)
+        meta = ok and data or nil
+    end
+    if not meta then return "unknown", "Not a repo" end
 
-    if not local_h or not remote_h then
-        return "unknown", "Could not determine HEAD."
+    if remote_sha == meta.remote_head then
+        return "up_to_date", nil, remote_sha
     end
 
-    if local_h == remote_h then
-        return "up_to_date", nil, local_h
+    -- If we have unpushed commits, local is ahead
+    if GitOps.hasLocalCommits(repo_path) then
+        return "local_ahead", nil, meta.remote_head, remote_sha
     end
 
-    -- Check if local is ancestor of remote (remote is ahead)
-    local _, exit1 = cmd_base("merge-base --is-ancestor " .. local_h .. " " .. remote_h)
-    if exit1 == 0 then
-        return "remote_ahead", nil, local_h, remote_h
-    end
-
-    -- Check if remote is ancestor of local (local is ahead)
-    local _, exit2 = cmd_base("merge-base --is-ancestor " .. remote_h .. " " .. local_h)
-    if exit2 == 0 then
-        return "local_ahead", nil, local_h, remote_h
-    end
-
-    return "diverged", "Local and remote have diverged.", local_h, remote_h
+    -- Remote differs and we have no local commits to push
+    return "remote_ahead", nil, meta.remote_head, remote_sha
 end
 
 function SyncEngine.getRemoteChanges(repo_path, branch, count)
     count = count or 10
-    branch = branch or GitOps.getCurrentBranch(repo_path) or "main"
-    local cmd = string.format(
-        "cd %q && git log --oneline --format='%%h|%%s|%%an|%%ar' HEAD..origin/%s -%d 2>&1",
-        repo_path, branch, count
-    )
-    local handle = io.popen(cmd)
-    if not handle then return {} end
-    local output = handle:read("*a")
-    handle:close()
-    local entries = {}
-    for line in output:gmatch("[^\r\n]+") do
-        local hash, msg, author, date = line:match("^(%w+)|(.+)|(.+)|(.+)$")
-        if hash then
-            entries[#entries + 1] = { hash = hash, message = msg, author = author, date = date }
-        end
-    end
-    return entries
+    return GitOps.log(repo_path, count) or {}
 end
 
 function SyncEngine.getLocalUnpushed(repo_path, branch, count)
-    count = count or 10
-    branch = branch or GitOps.getCurrentBranch(repo_path) or "main"
-    local cmd = string.format(
-        "cd %q && git log --oneline --format='%%h|%%s|%%an|%%ar' origin/%s..HEAD -%d 2>&1",
-        repo_path, branch, count
-    )
-    local handle = io.popen(cmd)
-    if not handle then return {} end
-    local output = handle:read("*a")
-    handle:close()
+    -- Return unpushed commits from metadata
+    local f = io.open(repo_path .. "/.ghbrowser.json", "r")
+    if not f then return {} end
+    local content = f:read("*a"); f:close()
+    local ok, meta = pcall(require("json").decode, content)
+    if not ok or not meta or not meta.unpushed then return {} end
+
     local entries = {}
-    for line in output:gmatch("[^\r\n]+") do
-        local hash, msg, author, date = line:match("^(%w+)|(.+)|(.+)|(.+)$")
-        if hash then
-            entries[#entries + 1] = { hash = hash, message = msg, author = author, date = date }
+    for i = #meta.unpushed, math.max(1, #meta.unpushed - count + 1), -1 do
+        local e = meta.unpushed[i]
+        if e then
+            entries[#entries + 1] = {
+                hash    = "local",
+                message = e.message,
+                author  = "you",
+                date    = e.date,
+            }
         end
     end
     return entries
@@ -102,8 +72,12 @@ function SyncEngine.getUncommitted(repo_path)
     return GitOps.status(repo_path) or {}
 end
 
+function SyncEngine.hasUnpushedCommits(repo_path)
+    return GitOps.hasLocalCommits(repo_path)
+end
+
 function SyncEngine.sync(repo_path, token, branch)
-    -- Auto-commit any local changes (including deletions) before syncing
+    -- Auto-commit any local changes before syncing
     local has_changes = GitOps.hasChanges(repo_path)
     if has_changes then
         local ok, msg = GitOps.commit(repo_path, "Sync: auto-commit")
