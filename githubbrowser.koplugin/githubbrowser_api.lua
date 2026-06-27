@@ -1,4 +1,4 @@
-9tlocal json        = require("json")
+local json        = require("json")
 local socket_http = require("socket.http")
 local socketutil  = require("socketutil")
 local ltn12       = require("ltn12")
