@@ -1,4 +1,4 @@
-local GitNotesSettings = require("githubbrowser_settings")
+local GithubBrowserSettings = require("githubbrowser_settings")
 
 local IgnoreEngine = {}
 
@@ -26,12 +26,12 @@ end
 function IgnoreEngine.shouldIgnore(path)
     local basename = path:match("([^/]+)/?$") or path
 
-    for _, p in ipairs(DEFAULT_PATTERNS) do
+    for __, p in ipairs(DEFAULT_PATTERNS) do
         if matchGlob(basename, p) then return true end
     end
 
-    local customs = GitNotesSettings.getIgnorePatterns()
-    for _, p in ipairs(customs) do
+    local customs = GithubBrowserSettings.getIgnorePatterns()
+    for __, p in ipairs(customs) do
         if matchGlob(basename, p) then return true end
     end
 
@@ -40,9 +40,9 @@ end
 
 function IgnoreEngine.filterEntries(entries)
     local result = {}
-    for _, entry in ipairs(entries) do
+    for __, entry in ipairs(entries) do
         if not IgnoreEngine.shouldIgnore(entry.name or entry) then
-            table.insert(result, entry)
+            result[#result + 1] = entry
         end
     end
     return result
@@ -50,8 +50,8 @@ end
 
 function IgnoreEngine.getDefaultPatterns()
     local copy = {}
-    for _, p in ipairs(DEFAULT_PATTERNS) do
-        table.insert(copy, p)
+    for __, p in ipairs(DEFAULT_PATTERNS) do
+        copy[#copy + 1] = p
     end
     return copy
 end

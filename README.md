@@ -76,11 +76,13 @@ Row 2 (Navigation): Tab | S+Tab | Undo | Redo | Home | End | up | down
 ### File Operations
 
 - **View**: Fetch and display text/code files inline (remote) or from disk (local)
+- **File Preview**: Files open in a preview view first with Edit Remote, Edit Locally, and Download action buttons
 - **Edit via API**: Edit remote files directly on GitHub (requires token)
 - **Edit Locally**: Download a remote file to disk, edit with the full toolbar, push later
 - **Commit to GitHub**: From the local editor, push changes directly via API
 - **Download**: Save binary files to device storage
 - **Create / Delete**: Add or remove files (requires token for remote, works directly on local)
+- **New File**: Create new files in attached repos directly from the repo view
 - **Search**: Search files by name or code content within a repository
 
 ### Navigation & Organization
@@ -88,8 +90,9 @@ Row 2 (Navigation): Tab | S+Tab | Undo | Redo | Home | End | up | down
 - **Pinned Repos**: Quick-access repos on the home screen
 - **Bookmarks**: Save favorite repos
 - **History**: Track recently visited repos with configurable limit
-- **Local Repos**: All attached (cloned) repos with sync status indicators
-- **Gesture Shortcuts**: Assign gestures to open GitNotes or jump to a specific Quick Repo
+- **Local Repos**: All attached repos with sync status indicators
+- **Add Local Folder**: Attach any folder on your device (git repo or plain folder) — browse and edit files from the home screen
+- **Multiple Quick Repos**: Assign multiple repos as gesture shortcuts, each with its own dedicated gesture
 - **DocumentRegistry**: Opens `.md`, `.markdown`, `.txt` files from KOReader's file manager
 
 ### Ignore System
@@ -198,5 +201,5 @@ githubbrowser.koplugin/
 ---
 
 **Author**: right9code
-**Version**: 2.0.0
+**Version**: 2.1.0
 **License**: [Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](https://creativecommons.org/licenses/by-nc/4.0/)

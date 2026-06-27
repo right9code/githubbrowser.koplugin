@@ -14,7 +14,7 @@ local util         = require("util")
 local _            = require("gettext")
 local T            = ffiUtil.template
 
-local GitNotesSettings       = require("githubbrowser_settings")
+local GithubBrowserSettings  = require("githubbrowser_settings")
 local EditorToolbar          = require("githubbrowser_editor_toolbar")
 local UndoStack              = require("githubbrowser_undo")
 
@@ -39,7 +39,7 @@ local function isTextFile(name)
     return TEXT_EXT[ext] or ext == ""
 end
 
-function Editor.openFile(file_path, caller_callback)
+function Editor.openFile(file_path, caller_callback, remote_origin)
     local attr = lfs.attributes(file_path)
     if not attr then
         local f, err = io.open(file_path, "wb")
@@ -61,16 +61,67 @@ function Editor.openFile(file_path, caller_callback)
     local test = io.open(file_path, "r+b")
     if test then test:close() else readonly = true end
 
-    local undo_stack = UndoStack.new(GitNotesSettings.getUndoStackSize())
+    local undo_stack = UndoStack.new(GithubBrowserSettings.getUndoStackSize())
     undo_stack:push(content, 1)
 
-    local show_kb = GitNotesSettings.getShowKeyboardOnStart()
+    local show_kb = GithubBrowserSettings.getShowKeyboardOnStart()
+
+    local saved_since_open = false
+    local commit_btn_ref = nil  -- will hold reference to the commit button
+
+    -- Check if this file is inside a git repo for the Commit button
+    local git_repo_root = nil
+    if remote_origin and not readonly then
+        local GitOps = require("githubbrowser_git")
+        local dir = file_path:match("^(.+)/[^/]+$")
+        git_repo_root = dir
+        while git_repo_root and git_repo_root ~= "/" do
+            if GitOps.isGitRepo(git_repo_root) then break end
+            git_repo_root = git_repo_root:match("^(.+)/[^/]+$")
+        end
+        if git_repo_root and not GitOps.isGitRepo(git_repo_root) then
+            git_repo_root = nil
+        end
+    end
+
+    -- Build the bottom button row
+    local bottom_buttons = {{
+        text = _("Close"),
+        id = "close",
+        callback = function()
+            input:onClose()
+        end,
+    }}
+    if git_repo_root then
+        bottom_buttons[#bottom_buttons + 1] = {
+            text = _("Commit"),
+            id = "commit",
+            enabled = false,  -- greyed out until Save is pressed
+            callback = function()
+                if not saved_since_open then
+                    UIManager:show(InfoMessage:new{ text = _("Save first, then commit."), timeout = 3 })
+                    return
+                end
+                local GitOps = require("githubbrowser_git")
+                local rel = file_path:sub(#git_repo_root + 2)
+                os.execute(string.format("cd %q && git add %q 2>/dev/null", git_repo_root, rel))
+                local device = GithubBrowserSettings.getDeviceName() or "koreader"
+                local msg = "Edit " .. rel .. " from " .. device
+                local c_ok = GitOps.commit(git_repo_root, msg)
+                if c_ok then
+                    UIManager:show(InfoMessage:new{ text = _("Committed!"), timeout = 2 })
+                else
+                    UIManager:show(InfoMessage:new{ text = _("Nothing to commit or commit failed."), timeout = 4 })
+                end
+            end,
+        }
+    end
 
     local input
     input = InputDialog:new{
         title             = filename,
         input             = content,
-        input_face        = Font:getFace(GitNotesSettings.getFontFace(), GitNotesSettings.getFontSize()),
+        input_face        = Font:getFace(GithubBrowserSettings.getFontFace(), GithubBrowserSettings.getFontSize()),
         fullscreen        = true,
         condensed         = true,
         allow_newline     = true,
@@ -80,10 +131,22 @@ function Editor.openFile(file_path, caller_callback)
         rotation_enabled  = true,
         keyboard_visible  = show_kb,
         scroll_by_pan     = true,
+        buttons = { bottom_buttons },
         save_callback = function(text, closing)
             if readonly then return false, _("File is read only") end
             local ok = util.writeToFile(text, file_path)
             if ok then
+                saved_since_open = true
+                -- Enable commit button if it exists
+                if input._button_table then
+                    for __, row in ipairs(input._button_table) do
+                        for __, btn in ipairs(row) do
+                            if btn.id == "commit" and btn.enabled == false then
+                                btn:enable()
+                            end
+                        end
+                    end
+                end
                 return true, _("File saved")
             else
                 return false, _("Failed to save")
@@ -102,7 +165,7 @@ function Editor.openFile(file_path, caller_callback)
         local orig_edit_cb = input._input_widget.edit_callback
         input._input_widget.edit_callback = function()
             if toolbar.restoring then return end
-            if orig_edit_cb then orig_edit_cb() end
+            if orig_edit_cb then orig_edit_cb(true) end
             local iw = input._input_widget
             local text = iw:getText()
             undo_stack:push(text, iw.charpos)
@@ -126,8 +189,8 @@ function Editor.openRemoteFile(name, text_content, download_url, buttons_extra)
 
     local buttons = {}
     if buttons_extra then
-        for _, row in ipairs(buttons_extra) do
-            table.insert(buttons, row)
+        for __, row in ipairs(buttons_extra) do
+            buttons[#buttons + 1] = row
         end
     end
 

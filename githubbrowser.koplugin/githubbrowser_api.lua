@@ -4,10 +4,17 @@ local socketutil  = require("socketutil")
 local ltn12       = require("ltn12")
 local logger      = require("logger")
 local bit         = require("bit")
+local table_new   = require("table.new")
 
-local GitNotesSettings = require("githubbrowser_settings")
+-- Cache frequently-used functions as locals (LuaJIT: avoids repeated global lookups)
+local table_concat = table.concat
+local pcall        = pcall
+local json_decode  = json.decode
+local json_encode  = json.encode
 
-local GitNotesAPI = {}
+local GithubBrowserSettings = require("githubbrowser_settings")
+
+local GithubBrowserAPI = {}
 
 local BASE_URL = "https://api.github.com"
 local DEFAULT_TIMEOUT = 30
@@ -48,9 +55,9 @@ local function extractRepoFromURL(url)
 end
 
 local function curlRequest(url, method, payload, token)
-    logger.dbg("GitNotesAPI: " .. method .. " " .. url)
+    logger.dbg("GithubBrowserAPI: " .. method .. " " .. url)
     local headers = {
-        ["User-Agent"]   = "KOReader-GitNotes/1.0",
+        ["User-Agent"]   = "KOReader-GithubBrowser/1.0",
         ["Accept"]       = "application/vnd.github.v3+json",
         ["Content-Type"] = "application/json",
     }
@@ -84,7 +91,7 @@ local function curlRequest(url, method, payload, token)
     elseif response == "" then
         return nil, "Empty response (HTTP " .. tostring(code) .. ")"
     end
-    local ok2, data = pcall(json.decode, response)
+    local ok2, data = pcall(json_decode, response)
     if not ok2 then
         return nil, "Failed to parse response (HTTP " .. tostring(code) .. "): " .. response:sub(1, 200)
     end
@@ -95,13 +102,13 @@ local function curlRequest(url, method, payload, token)
 end
 
 local function makeRequest(url, custom_accept)
-    logger.dbg("GitNotesAPI: GET " .. url)
+    logger.dbg("GithubBrowserAPI: GET " .. url)
     local headers = {
-        ["User-Agent"] = "KOReader-GitNotes/1.0",
+        ["User-Agent"] = "KOReader-GithubBrowser/1.0",
         ["Accept"]     = custom_accept or "application/vnd.github.v3+json",
     }
     local repo_full = extractRepoFromURL(url)
-    local token = GitNotesSettings.getTokenForRepo(repo_full)
+    local token = GithubBrowserSettings.getTokenForRepo(repo_full)
     if token and token ~= "" then
         headers["Authorization"] = "token " .. token
     end
@@ -131,7 +138,7 @@ local function makeRequest(url, custom_accept)
     elseif code ~= 200 then
         return nil, "API error (HTTP " .. tostring(code) .. ")"
     end
-    local ok2, data = pcall(json.decode, body)
+    local ok2, data = pcall(json_decode, body)
     if not ok2 then
         return nil, "Failed to parse API response."
     end
@@ -140,9 +147,9 @@ end
 
 local function fetchRaw(raw_url)
     local response_body = {}
-    local headers = { ["User-Agent"] = "KOReader-GitNotes/1.0" }
+    local headers = { ["User-Agent"] = "KOReader-GithubBrowser/1.0" }
     local repo_full = extractRepoFromURL(raw_url)
-    local token = GitNotesSettings.getTokenForRepo(repo_full)
+    local token = GithubBrowserSettings.getTokenForRepo(repo_full)
     if token and token ~= "" then
         headers["Authorization"] = "token " .. token
     end
@@ -188,11 +195,11 @@ end
 
 -- ── Public API ────────────────────────────────────────────────────────────────
 
-function GitNotesAPI.getRepo(owner, repo)
+function GithubBrowserAPI.getRepo(owner, repo)
     return makeRequest(BASE_URL .. "/repos/" .. owner .. "/" .. repo)
 end
 
-function GitNotesAPI.getContents(owner, repo, path, ref)
+function GithubBrowserAPI.getContents(owner, repo, path, ref)
     local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/contents"
     if path and path ~= "" then
         url = url .. "/" .. urlEncodePath(path)
@@ -203,24 +210,24 @@ function GitNotesAPI.getContents(owner, repo, path, ref)
     return makeRequest(url)
 end
 
-function GitNotesAPI.getTree(owner, repo, ref)
+function GithubBrowserAPI.getTree(owner, repo, ref)
     ref = ref or "main"
     local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo
               .. "/git/trees/" .. urlEncodePath(ref) .. "?recursive=1"
     return makeRequest(url)
 end
 
-function GitNotesAPI.searchCode(owner, repo, query)
+function GithubBrowserAPI.searchCode(owner, repo, query)
     local full_query = query .. " repo:" .. owner .. "/" .. repo
     local url = BASE_URL .. "/search/code?q=" .. urlEncodeQuery(full_query) .. "&per_page=50"
     return makeRequest(url, "application/vnd.github.v3.text-match+json")
 end
 
-function GitNotesAPI.getRawFile(raw_url)
+function GithubBrowserAPI.getRawFile(raw_url)
     return fetchRaw(raw_url)
 end
 
-function GitNotesAPI.downloadFile(raw_url, dest_path)
+function GithubBrowserAPI.downloadFile(raw_url, dest_path)
     local data, err = fetchRaw(raw_url)
     if not data then return nil, err end
     local fh, ferr = io.open(dest_path, "wb")
@@ -232,7 +239,7 @@ function GitNotesAPI.downloadFile(raw_url, dest_path)
     return true, nil
 end
 
-function GitNotesAPI.formatSize(bytes)
+function GithubBrowserAPI.formatSize(bytes)
     if not bytes or bytes == 0 then return "" end
     if bytes < 1024 then
         return bytes .. " B"
@@ -243,7 +250,7 @@ function GitNotesAPI.formatSize(bytes)
     end
 end
 
-function GitNotesAPI.parseRepoInput(input)
+function GithubBrowserAPI.parseRepoInput(input)
     if not input then return nil, nil end
     input = input:match("^%s*(.-)%s*$")
     input = input:gsub("^https?://github%.com/", "")
@@ -253,7 +260,7 @@ function GitNotesAPI.parseRepoInput(input)
     return owner, repo
 end
 
-function GitNotesAPI.updateFile(owner, repo, path, content, sha, branch, message, token)
+function GithubBrowserAPI.updateFile(owner, repo, path, content, sha, branch, message, token)
     if not token or token == "" then
         return nil, "A GitHub token is required to edit files."
     end
@@ -267,10 +274,10 @@ function GitNotesAPI.updateFile(owner, repo, path, content, sha, branch, message
     if sha and sha ~= "" then
         body.sha = sha
     end
-    return curlRequest(url, "PUT", json.encode(body), token)
+    return curlRequest(url, "PUT", json_encode(body), token)
 end
 
-function GitNotesAPI.deleteFile(owner, repo, path, sha, branch, message, token)
+function GithubBrowserAPI.deleteFile(owner, repo, path, sha, branch, message, token)
     if not token or token == "" then
         return nil, "A GitHub token is required to delete files."
     end
@@ -281,23 +288,23 @@ function GitNotesAPI.deleteFile(owner, repo, path, sha, branch, message, token)
         sha     = sha,
         branch  = branch,
     }
-    return curlRequest(url, "DELETE", json.encode(body), token)
+    return curlRequest(url, "DELETE", json_encode(body), token)
 end
 
-function GitNotesAPI.deleteDirectory(owner, repo, path, branch, message, token)
-    local contents, err = GitNotesAPI.getContents(owner, repo, path, branch)
+function GithubBrowserAPI.deleteDirectory(owner, repo, path, branch, message, token)
+    local contents, err = GithubBrowserAPI.getContents(owner, repo, path, branch)
     if not contents then return false, "Failed to read directory: " .. (err or "?") end
     if contents.type == "file" then return false, "Path is a file, not a directory" end
-    for _, entry in ipairs(contents) do
+    for __, entry in ipairs(contents) do
         if entry.type == "dir" then
-            local ok, err2 = GitNotesAPI.deleteDirectory(owner, repo, entry.path, branch, message, token)
+            local ok, err2 = GithubBrowserAPI.deleteDirectory(owner, repo, entry.path, branch, message, token)
             if not ok then return false, err2 end
         elseif entry.type == "file" then
-            local ok, err2 = GitNotesAPI.deleteFile(owner, repo, entry.path, entry.sha, branch, message, token)
+            local ok, err2 = GithubBrowserAPI.deleteFile(owner, repo, entry.path, entry.sha, branch, message, token)
             if not ok then return false, err2 end
         end
     end
     return true, nil
 end
 
-return GitNotesAPI
+return GithubBrowserAPI

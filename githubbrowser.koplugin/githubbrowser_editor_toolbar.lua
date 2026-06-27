@@ -71,7 +71,7 @@ function EditorToolbar:getWidget()
     local fmt_btn_w = math.floor(bar_width / #fmt_keys)
     local fmt_row = HorizontalGroup:new{ allow_mirroring = false }
     for _, kd in ipairs(fmt_keys) do
-        table.insert(fmt_row, makeBtn(kd.text, kd.callback, fmt_btn_w))
+        fmt_row[#fmt_row + 1] = makeBtn(kd.text, kd.callback, fmt_btn_w)
     end
 
     -- ── Row 2: Navigation ─────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ function EditorToolbar:getWidget()
     local nav_btn_w = math.floor(bar_width / #nav_keys)
     local nav_row = HorizontalGroup:new{ allow_mirroring = false }
     for _, kd in ipairs(nav_keys) do
-        table.insert(nav_row, makeBtn(kd.text, kd.callback, nav_btn_w))
+        nav_row[#nav_row + 1] = makeBtn(kd.text, kd.callback, nav_btn_w)
     end
 
     -- ── Separators ────────────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ function EditorToolbar:wrapText(prefix, suffix)
     if start_pos and end_pos and start_pos <= end_pos then
         local selected_chars = {}
         for i = start_pos, end_pos do
-            table.insert(selected_chars, iw.charlist[i])
+            selected_chars[#selected_chars + 1] = iw.charlist[i]
         end
         local selected_text = table.concat(selected_chars)
         for i = end_pos, start_pos, -1 do
@@ -279,14 +279,14 @@ function EditorToolbar:_doInsertTable(cols, rows)
     local lines = {}
     local header = "|"
     for c = 1, cols do header = header .. " Header " .. c .. " |" end
-    table.insert(lines, header)
+    lines[#lines + 1] = header
     local sep = "|"
     for c = 1, cols do sep = sep .. " --- |" end
-    table.insert(lines, sep)
+    lines[#lines + 1] = sep
     for _ = 1, rows - 1 do
         local row = "|"
         for _ = 1, cols do row = row .. "  |" end
-        table.insert(lines, row)
+        lines[#lines + 1] = row
     end
     self:getInputWidget():addChars("\n" .. table.concat(lines, "\n") .. "\n")
 end

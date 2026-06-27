@@ -71,7 +71,7 @@ function SyncEngine.getRemoteChanges(repo_path, branch, count)
     for line in output:gmatch("[^\r\n]+") do
         local hash, msg, author, date = line:match("^(%w+)|(.+)|(.+)|(.+)$")
         if hash then
-            table.insert(entries, { hash = hash, message = msg, author = author, date = date })
+            entries[#entries + 1] = { hash = hash, message = msg, author = author, date = date }
         end
     end
     return entries
@@ -92,7 +92,7 @@ function SyncEngine.getLocalUnpushed(repo_path, branch, count)
     for line in output:gmatch("[^\r\n]+") do
         local hash, msg, author, date = line:match("^(%w+)|(.+)|(.+)|(.+)$")
         if hash then
-            table.insert(entries, { hash = hash, message = msg, author = author, date = date })
+            entries[#entries + 1] = { hash = hash, message = msg, author = author, date = date }
         end
     end
     return entries
@@ -103,6 +103,17 @@ function SyncEngine.getUncommitted(repo_path)
 end
 
 function SyncEngine.sync(repo_path, token, branch)
+    -- Auto-commit any local changes (including deletions) before syncing
+    local has_changes = GitOps.hasChanges(repo_path)
+    if has_changes then
+        local ok, msg = GitOps.commit(repo_path, "Sync: auto-commit")
+        if ok then
+            logger.dbg("SyncEngine: auto-committed local changes: " .. (msg or ""))
+        else
+            logger.dbg("SyncEngine: auto-commit skipped: " .. (msg or ""))
+        end
+    end
+
     local status = SyncEngine.checkStatus(repo_path, branch)
 
     if status == "fetch_failed" then

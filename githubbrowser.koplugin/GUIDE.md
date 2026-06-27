@@ -44,10 +44,12 @@ A combined Git client and Markdown editor for KOReader.
 
 ```
 GitNotes
+├── ⚡ owner/repo                    ← Quick repo (gesture shortcut)
 ├── 🔓 Browse public repo...        ← Browse any public GitHub repo
 ├── 🔐 Browse private repo...       ← Browse with token authentication
-├── ⚡ owner/repo                    ← Quick access to last visited
-├── ── Local Repos ──                ← Cloned repos with sync status
+├── 📁 Add Local Folder             ← Attach any device folder
+├── ⚡ last/repo                     ← Quick access to last visited
+├── ── Local Repos ──                ← Attached repos (git or plain folder)
 │   ├── 📁 my-notes
 │   └── 📁 website
 ├── ── Pinned ──                     ← Pinned for quick access
@@ -57,6 +59,8 @@ GitNotes
 ├── ⚙️ Settings
 └── ℹ️ About
 ```
+
+**Quick repos** are gesture shortcuts configured in Settings. If you've set up multiple quick repos, each appears at the top of the home screen with a ⚡ icon and its assigned shortcut number.
 
 ---
 
@@ -121,19 +125,17 @@ From the home screen, tap a repo under **Local Repos**. The view shows:
 local: my-repo [main]
 ├── ◂ Back
 ├── ☆ Bookmark
-├── 📥 Pull                    ← Fetch + merge remote changes
-├── 📤 Push                    ← Send local commits to GitHub
-├── 🔄 Sync                    ← Pull then push (bidirectional)
-├── 📝 Commit                  ← Commit staged changes
-├── 📜 Recent Changes          ← See remote/local diffs
+├── ⚙️ Git Operations ▸       ← Submenu with all git actions
+├── ➕ New File               ← Create a new file in the repo
 ├── 🔍 Search files
-├── 🔑 Change Token
-├── 📴 Detach local copy       ← Remove local clone (keeps bookmark)
+├── 📴 Remove local folder    ← Detach local copy (keeps bookmark)
 ├── ────────────────────
 ├── 📁 src/
 ├── 📄 notes.md
 └── 📄 config.json
 ```
+
+The **Git Operations** submenu contains: Pull, Push, Sync, Commit, Recent Changes, and Change Token.
 
 ### Browsing Local Files
 
@@ -310,8 +312,9 @@ From a repo view → tap **🔑 Change Token** → select which token to use for
 | **Git Workspace** | Root directory for cloned repos |
 | **Device Name** | Tag in commit messages (e.g., "koreader", "libra2") |
 | **Auto-sync on open** | Check for remote changes when opening a local repo |
+| **Max history entries** | Limit how many recent repos are tracked (default: 20) |
 | **Ignore Patterns** | Files/folders to hide from listings (`.sdr` is always ignored) |
-| **Quick Repo** | A repo (`owner/repo`) opened by the "GitNotes: Quick Repo" gesture |
+| **Quick Repo** | Assign repos to gesture shortcuts (multiple supported) |
 
 ---
 
@@ -468,11 +471,12 @@ Home → Browse public repo → owner/repo
 
 This workflow works without cloning the repo. The file is saved locally and pushed via API in one step.
 
-### Workflow 9: Quick Repo Gesture
+### Workflow 9: Quick Repo Gestures
 
-1. Settings → **Quick Repo** → enter `owner/repo`
-2. KOReader Settings → Gestures → assign "GitNotes: Quick Repo" to a gesture
+1. Settings → **Quick Repo** → select gesture slot → enter `owner/repo`
+2. KOReader Settings → Gestures → assign "GitNotes: Quick Repo 1" (or 2, 3) to a gesture
 3. Perform the gesture → jumps directly to that repo (remote or local depending on attachment)
+4. Repeat with additional gesture slots for multiple quick repos
 
 ### Workflow 10: WiFi-Aware Operations
 

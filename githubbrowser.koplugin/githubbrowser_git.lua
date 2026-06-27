@@ -1,7 +1,7 @@
 local logger = require("logger")
 local lfs    = require("libs/libkoreader-lfs")
 
-local GitNotesSettings = require("githubbrowser_settings")
+local GithubBrowserSettings = require("githubbrowser_settings")
 
 local GitOps = {}
 
@@ -102,7 +102,7 @@ function GitOps.commit(repo_path, message)
     local _, ok1 = gitExec("add -A", repo_path)
     if not ok1 then return false, "Failed to stage changes" end
 
-    local device = GitNotesSettings.getDeviceName()
+    local device = GithubBrowserSettings.getDeviceName()
     local full_msg = message .. "\n\nFrom: " .. device
     local output, ok2 = gitExec("commit -m " .. shellEscape(full_msg), repo_path)
     if not ok2 then return false, "Nothing to commit or commit failed.\n" .. output end
@@ -116,7 +116,7 @@ function GitOps.status(repo_path)
     for line in output:gmatch("[^\r\n]+") do
         local status = line:sub(1, 2)
         local file = line:sub(4)
-        table.insert(files, { status = status, file = file })
+        files[#files + 1] = { status = status, file = file }
     end
     return files
 end
@@ -138,12 +138,12 @@ function GitOps.log(repo_path, count)
     for line in output:gmatch("[^\r\n]+") do
         local hash, msg, author, date = line:match("^(%w+)|(.+)|(.+)|(.+)$")
         if hash then
-            table.insert(entries, {
+            entries[#entries + 1] = {
                 hash    = hash,
                 message = msg,
                 author  = author,
                 date    = date,
-            })
+            }
         end
     end
     return entries
@@ -169,7 +169,7 @@ function GitOps.listBranches(repo_path)
         local is_current = line:sub(1, 1) == "*"
         local name = line:gsub("^%*?%s+", ""):match("^%s*(.-)%s*$")
         if name and name ~= "" then
-            table.insert(branches, { name = name, is_current = is_current })
+            branches[#branches + 1] = { name = name, is_current = is_current }
         end
     end
     return branches
@@ -195,7 +195,7 @@ function GitOps.hasLocalCommits(repo_path)
 end
 
 function GitOps.getLocalPath(owner, repo)
-    local workspace = GitNotesSettings.getWorkspace()
+    local workspace = GithubBrowserSettings.getWorkspace()
     return workspace .. "/" .. repo
 end
 
