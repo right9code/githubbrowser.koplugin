@@ -1,10 +1,11 @@
-local json        = require("json")
+9tlocal json        = require("json")
 local socket_http = require("socket.http")
 local socketutil  = require("socketutil")
 local ltn12       = require("ltn12")
 local logger      = require("logger")
 local bit         = require("bit")
 local table_new   = require("table.new")
+local lfs         = require("libs/libkoreader-lfs")
 
 -- Cache frequently-used functions as locals (LuaJIT: avoids repeated global lookups)
 local table_concat = table.concat
@@ -455,13 +456,15 @@ function GithubBrowserAPI.downloadTree(owner, repo, ref, token, dest_path)
     return downloaded, nil
 end
 
--- Download repo as zipball (single request) - much faster than file-by-file
+-- Download repo as tarball (single request) - much faster than file-by-file
+-- Uses tarball instead of zipball because `tar` is universally available on
+-- all KOReader devices (Kobo/Kindle/Android) via BusyBox, while `unzip` often is not.
 function GithubBrowserAPI.downloadZipball(owner, repo, ref, dest_path, token)
     ref = ref or "main"
-    local zip_url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/zipball/" .. urlEncodeQuery(ref)
+    local tar_url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/tarball/" .. urlEncodeQuery(ref)
 
-    -- Download zip to temp file
-    local tmp_zip = dest_path .. ".zip"
+    -- Download tarball to temp file
+    local tmp_tar = dest_path .. ".tar.gz"
     local response_body = {}
     local headers = {
         ["User-Agent"] = "KOReader-GithubBrowser/1.0",
@@ -472,7 +475,7 @@ function GithubBrowserAPI.downloadZipball(owner, repo, ref, dest_path, token)
     end
     socketutil:set_timeout(30, 300)  -- longer timeout for large downloads
     local ok, code = socket_http.request {
-        url      = zip_url,
+        url      = tar_url,
         method   = "GET",
         headers  = headers,
         sink     = ltn12.sink.table(response_body),
@@ -480,40 +483,52 @@ function GithubBrowserAPI.downloadZipball(owner, repo, ref, dest_path, token)
     }
     socketutil:reset_timeout()
     if not ok then
-        return nil, "Network error downloading zipball: " .. tostring(code)
+        return nil, "Network error downloading tarball: " .. tostring(code)
     end
     if type(code) == "number" and code ~= 200 then
-        return nil, "Failed to download zipball (HTTP " .. tostring(code) .. ")"
+        return nil, "Failed to download tarball (HTTP " .. tostring(code) .. ")"
     end
 
-    local zip_data = table_concat(response_body)
-    if #zip_data == 0 then
-        return nil, "Empty zipball response"
+    local tar_data = table_concat(response_body)
+    if #tar_data == 0 then
+        return nil, "Empty tarball response"
     end
 
-    -- Write zip to temp file
-    local fh = io.open(tmp_zip, "wb")
+    -- Write tarball to temp file
+    local fh = io.open(tmp_tar, "wb")
     if not fh then
-        return nil, "Cannot write temp zip file"
+        return nil, "Cannot write temp tarball file"
     end
-    fh:write(zip_data)
+    fh:write(tar_data)
     fh:close()
 
-    -- Extract using unzip command
-    local extract_dir = dest_path .. "_zip_extract"
+    -- Extract using tar (available on all KOReader devices via BusyBox)
+    local extract_dir = dest_path .. "_tar_extract"
     os.execute(string.format("rm -rf %q", extract_dir))
-    local unzip_cmd = string.format("unzip -q -o %q -d %q 2>&1", tmp_zip, extract_dir)
-    local ret = os.execute(unzip_cmd)
+    ensureDir(extract_dir)
+    local tar_cmd = string.format("tar xzf %q -C %q 2>&1", tmp_tar, extract_dir)
+    local ret = os.execute(tar_cmd)
     if ret ~= 0 and ret ~= true then
-        os.execute(string.format("rm -rf %q %q", tmp_zip, extract_dir))
-        return nil, "unzip failed (exit " .. tostring(ret) .. "). Is unzip installed?"
+        -- tar with gzip might not be supported; try with separate gunzip
+        local gunzip_cmd = string.format("gunzip -f %q 2>&1", tmp_tar)
+        local ret2 = os.execute(gunzip_cmd)
+        if ret2 == 0 or ret2 == true then
+            local plain_tar = dest_path .. ".tar"
+            local tar_cmd2 = string.format("tar xf %q -C %q 2>&1", plain_tar, extract_dir)
+            ret = os.execute(tar_cmd2)
+            os.remove(plain_tar)
+        end
+        if ret ~= 0 and ret ~= true then
+            os.execute(string.format("rm -rf %q %q", tmp_tar, extract_dir))
+            return nil, "tar extraction failed. Is tar installed?"
+        end
     end
 
-    -- GitHub zipballs contain a single directory like owner-repo-sha/
+    -- GitHub tarballs contain a single directory like owner-repo-sha/
     -- Find that directory and move its contents to dest_path
     local ok_iter, iter, dir_obj = pcall(lfs.dir, extract_dir)
     if not ok_iter then
-        os.execute(string.format("rm -rf %q %q", tmp_zip, extract_dir))
+        os.execute(string.format("rm -rf %q %q", tmp_tar, extract_dir))
         return nil, "Cannot read extracted directory"
     end
     local inner_dir = nil
@@ -538,7 +553,7 @@ function GithubBrowserAPI.downloadZipball(owner, repo, ref, dest_path, token)
     end
 
     -- Cleanup temp files
-    os.execute(string.format("rm -rf %q %q", tmp_zip, extract_dir))
+    os.execute(string.format("rm -rf %q %q", tmp_tar, extract_dir))
 
     return true, nil
 end
