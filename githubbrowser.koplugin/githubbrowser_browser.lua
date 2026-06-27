@@ -1,5 +1,4 @@
-loo all lua check??
-al Menu         = require("ui/widget/menu")
+local Menu         = require("ui/widget/menu")
 local Font         = require("ui/font")
 local InputDialog  = require("ui/widget/inputdialog")
 local TextViewer   = require("ui/widget/textviewer")
@@ -1491,11 +1490,18 @@ function BrowserUI.attachRepo(owner, repo, branch, on_close)
     local dest = workspace .. "/" .. repo
 
     if lfs.attributes(dest, "mode") then
-        UIManager:show(ConfirmBox:new{
+        local confirm_box
+        confirm_box = ConfirmBox:new{
             text = string.format(_("Directory \"%s\" already exists.\nOverwrite?"), dest),
             ok_text = _("Overwrite"),
-            ok_callback = function() BrowserUI._doClone(owner, repo, branch, dest, on_close) end,
-        })
+            ok_callback = function()
+                UIManager:close(confirm_box)
+                UIManager:nextTick(function()
+                    BrowserUI._doClone(owner, repo, branch, dest, on_close)
+                end)
+            end,
+        }
+        UIManager:show(confirm_box)
     else
         BrowserUI._doClone(owner, repo, branch, dest, on_close)
     end
@@ -1505,14 +1511,62 @@ function BrowserUI._doClone(owner, repo, branch, dest, on_close)
     local full_name = owner .. "/" .. repo
     local token = GithubBrowserSettings.getTokenForRepo(full_name)
 
-    local loading = InfoMessage:new{ text = _("Cloning..."), timeout = 300 }
-    UIManager:show(loading)
+    -- Progress dialog using ProgressbarDialog (works across KOReader versions)
+    local ok_pd, ProgressbarDialog = pcall(require, "ui/widget/progressbardialog")
+    local progress_widget, report_cb, progress_text_widget
+    local use_dialog = ok_pd and ProgressbarDialog
+
+    if use_dialog then
+        progress_widget = ProgressbarDialog:new{
+            title = _("Cloning ") .. repo .. "...",
+            subtitle = dest,
+            progress_max = 100,  -- will use percentage
+            refresh_time_seconds = 0.5,
+            dismissable = false,
+        }
+        if progress_widget.progress_bar then
+            progress_widget.progress_bar.fillcolor = require("ffi/blitbuffer").COLOR_BLACK
+        end
+        report_cb = function(pct)
+            progress_widget:reportProgress(pct)
+        end
+        progress_widget:show()
+    else
+        -- Fallback: simple InfoMessage with text updates
+        progress_text_widget = InfoMessage:new{
+            text = _("Cloning ") .. repo .. "...",
+            timeout = 120,
+        }
+        UIManager:show(progress_text_widget)
+    end
     UIManager:forceRePaint()
 
     local url = "https://github.com/" .. owner .. "/" .. repo
-    local ok, output = GitOps.clone(url, dest, token)
+    local ok, output = GitOps.clone(url, dest, token, false,
+        function(phase, current, total, current_file)
+            if phase == "listing" then
+                if use_dialog then
+                    report_cb(0)
+                else
+                    progress_text_widget:setText(repo .. ": found " .. current .. " files...")
+                end
+            elseif total > 0 then
+                local pct = math.floor(current / total * 100)
+                if use_dialog then
+                    report_cb(pct)
+                else
+                    local short_path = current_file and current_file:match("([^/]+)$") or current_file or ""
+                    progress_text_widget:setText(current .. "/" .. total .. "  " .. short_path)
+                end
+            end
+        end
+    )
 
-    UIManager:close(loading)
+    if use_dialog then
+        UIManager:close(progress_widget)
+    else
+        UIManager:close(progress_text_widget)
+    end
 
     if not ok then
         UIManager:show(InfoMessage:new{ text = _("Clone failed:\n") .. (output or "?"), timeout = 8 })
@@ -1526,7 +1580,7 @@ function BrowserUI._doClone(owner, repo, branch, dest, on_close)
         last_sync_time = os.time(),
     })
 
-    UIManager:show(InfoMessage:new{ text = _("Cloned to: ") .. dest, timeout = 4 })
+    UIManager:show(InfoMessage:new{ text = _("Cloned to: ") .. dest .. "\n" .. (output or ""), timeout = 4 })
     if on_close then on_close() end
 end
 

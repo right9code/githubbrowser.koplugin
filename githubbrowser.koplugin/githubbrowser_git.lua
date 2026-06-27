@@ -144,9 +144,10 @@ function GitOps.getLocalPath(owner, repo)
     return workspace .. "/" .. repo
 end
 
--- ── Clone (download entire repo via GitHub API) ──────────────────────────────
+-- ── Clone (download entire repo as zipball - single HTTP request) ───────────
 
-function GitOps.clone(url, dest, token, shallow)
+-- progress_cb(phase, current, total, current_file) where phase is "listing" or "downloading"
+function GitOps.clone(url, dest, token, shallow, progress_cb)
     local owner, repo = parseOwnerRepo(url)
     if not owner or not repo then
         return false, "Invalid GitHub URL: " .. tostring(url)
@@ -162,33 +163,44 @@ function GitOps.clone(url, dest, token, shallow)
     -- Get remote HEAD sha
     local remote_sha = GithubBrowserAPI.getRemoteHead(owner, repo, branch)
 
-    -- Download all files via raw content URLs
-    local tree_data, tree_err = GithubBrowserAPI.getTree(owner, repo, branch)
-    if not tree_data or not tree_data.tree then
-        return false, "Failed to get repo tree: " .. (tree_err or "?")
+    if progress_cb then
+        progress_cb("downloading", 0, 100, "Downloading repository...")
     end
 
-    ensureDir(dest)
+    -- Download repo as zipball (single HTTP request - much faster than file-by-file)
+    local ok2, zip_err = GithubBrowserAPI.downloadZipball(owner, repo, branch, dest, token)
+    if not ok2 then
+        return false, "Failed to download repo: " .. (zip_err or "?")
+    end
+
+    if progress_cb then
+        progress_cb("downloading", 50, 100, "Indexing files...")
+    end
+
+    -- Build snapshot by hashing all downloaded files
     local snapshot = {}
     local downloaded = 0
-    local files_to_get = {}
-    for _, entry in ipairs(tree_data.tree) do
-        if entry.type == "blob" then
-            files_to_get[#files_to_get + 1] = entry
+    local function walkForSnapshot(dir, prefix)
+        local ok_iter, iter, dir_obj = pcall(lfs.dir, dir)
+        if not ok_iter then return end
+        for entry in iter, dir_obj do
+            if entry ~= "." and entry ~= ".." and entry ~= ".git"
+               and entry ~= META_FILE and entry ~= ".gitignore" then
+                local full = dir .. "/" .. entry
+                local rel = prefix ~= "" and (prefix .. "/" .. entry) or entry
+                local attr = lfs.attributes(full)
+                if attr then
+                    if attr.mode == "directory" then
+                        walkForSnapshot(full, rel)
+                    else
+                        snapshot[rel] = hashFile(full)
+                        downloaded = downloaded + 1
+                    end
+                end
+            end
         end
     end
-
-    for _, entry in ipairs(files_to_get) do
-        local raw_url = "https://raw.githubusercontent.com/" .. owner .. "/" .. repo
-                       .. "/" .. branch .. "/" .. entry.path
-        local file_data = GithubBrowserAPI.getRawFile(raw_url)
-        if file_data then
-            local full_path = dest .. "/" .. entry.path
-            writeFile(full_path, file_data)
-            snapshot[entry.path] = hashContent(file_data)
-            downloaded = downloaded + 1
-        end
-    end
+    walkForSnapshot(dest, "")
 
     -- Save metadata
     local meta = {
@@ -202,7 +214,11 @@ function GitOps.clone(url, dest, token, shallow)
     }
     writeMeta(dest, meta)
 
-    logger.dbg("GitOps: cloned " .. owner .. "/" .. repo .. " (" .. downloaded .. " files)")
+    if progress_cb then
+        progress_cb("downloading", 100, 100, "Done")
+    end
+
+    logger.dbg("GitOps: " .. owner .. "/" .. repo .. " cloned (" .. downloaded .. " files)")
     return true, "Cloned " .. downloaded .. " files", dest
 end
 

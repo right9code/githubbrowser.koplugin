@@ -210,11 +210,51 @@ function GithubBrowserAPI.getContents(owner, repo, path, ref)
     return makeRequest(url)
 end
 
-function GithubBrowserAPI.getTree(owner, repo, ref)
+function GithubBrowserAPI._getTreeViaContents(owner, repo, ref, progress_cb)
+    logger.dbg("GithubBrowserAPI: tree truncated, falling back to Contents API")
+    local tree = {}
+    local file_count = 0
+    local function fetchDir(path)
+        local page = 1
+        while true do
+            local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/contents"
+            if path and path ~= "" then
+                url = url .. "/" .. urlEncodePath(path)
+            end
+            url = url .. "?ref=" .. urlEncodeQuery(ref) .. "&per_page=100&page=" .. tostring(page)
+            local data, err = makeRequest(url)
+            if not data then break end
+            -- data is an array of entries
+            if type(data) ~= "table" or #data == 0 then break end
+            for _, entry in ipairs(data) do
+                if entry.type == "file" then
+                    file_count = file_count + 1
+                    tree[#tree + 1] = { path = entry.path, type = "blob", sha = entry.sha }
+                    if progress_cb then
+                        progress_cb(file_count, 0, entry.path)
+                    end
+                elseif entry.type == "dir" then
+                    fetchDir(entry.path)
+                end
+            end
+            if #data < 100 then break end
+            page = page + 1
+        end
+    end
+    fetchDir("")
+    return { tree = tree, truncated = false }, nil
+end
+
+function GithubBrowserAPI.getTree(owner, repo, ref, progress_cb)
     ref = ref or "main"
     local url = BASE_URL .. "/repos/" .. owner .. "/" .. repo
               .. "/git/trees/" .. urlEncodePath(ref) .. "?recursive=1"
-    return makeRequest(url)
+    local data, err = makeRequest(url)
+    if not data then return nil, err end
+    if data.truncated then
+        return GithubBrowserAPI._getTreeViaContents(owner, repo, ref, progress_cb)
+    end
+    return data, nil
 end
 
 function GithubBrowserAPI.searchCode(owner, repo, query)
@@ -413,6 +453,94 @@ function GithubBrowserAPI.downloadTree(owner, repo, ref, token, dest_path)
         end
     end
     return downloaded, nil
+end
+
+-- Download repo as zipball (single request) - much faster than file-by-file
+function GithubBrowserAPI.downloadZipball(owner, repo, ref, dest_path, token)
+    ref = ref or "main"
+    local zip_url = BASE_URL .. "/repos/" .. owner .. "/" .. repo .. "/zipball/" .. urlEncodeQuery(ref)
+
+    -- Download zip to temp file
+    local tmp_zip = dest_path .. ".zip"
+    local response_body = {}
+    local headers = {
+        ["User-Agent"] = "KOReader-GithubBrowser/1.0",
+        ["Accept"]     = "application/vnd.github.v3+json",
+    }
+    if token and token ~= "" then
+        headers["Authorization"] = "token " .. token
+    end
+    socketutil:set_timeout(30, 300)  -- longer timeout for large downloads
+    local ok, code = socket_http.request {
+        url      = zip_url,
+        method   = "GET",
+        headers  = headers,
+        sink     = ltn12.sink.table(response_body),
+        redirect = true,
+    }
+    socketutil:reset_timeout()
+    if not ok then
+        return nil, "Network error downloading zipball: " .. tostring(code)
+    end
+    if type(code) == "number" and code ~= 200 then
+        return nil, "Failed to download zipball (HTTP " .. tostring(code) .. ")"
+    end
+
+    local zip_data = table_concat(response_body)
+    if #zip_data == 0 then
+        return nil, "Empty zipball response"
+    end
+
+    -- Write zip to temp file
+    local fh = io.open(tmp_zip, "wb")
+    if not fh then
+        return nil, "Cannot write temp zip file"
+    end
+    fh:write(zip_data)
+    fh:close()
+
+    -- Extract using unzip command
+    local extract_dir = dest_path .. "_zip_extract"
+    os.execute(string.format("rm -rf %q", extract_dir))
+    local unzip_cmd = string.format("unzip -q -o %q -d %q 2>&1", tmp_zip, extract_dir)
+    local ret = os.execute(unzip_cmd)
+    if ret ~= 0 and ret ~= true then
+        os.execute(string.format("rm -rf %q %q", tmp_zip, extract_dir))
+        return nil, "unzip failed (exit " .. tostring(ret) .. "). Is unzip installed?"
+    end
+
+    -- GitHub zipballs contain a single directory like owner-repo-sha/
+    -- Find that directory and move its contents to dest_path
+    local ok_iter, iter, dir_obj = pcall(lfs.dir, extract_dir)
+    if not ok_iter then
+        os.execute(string.format("rm -rf %q %q", tmp_zip, extract_dir))
+        return nil, "Cannot read extracted directory"
+    end
+    local inner_dir = nil
+    for entry in iter, dir_obj do
+        if entry ~= "." and entry ~= ".." then
+            local full = extract_dir .. "/" .. entry
+            if lfs.attributes(full, "mode") == "directory" then
+                inner_dir = full
+                break
+            end
+        end
+    end
+
+    if inner_dir then
+        -- Move contents from inner dir to dest_path
+        ensureDir(dest_path)
+        os.execute(string.format("cp -a %q/. %q/ 2>/dev/null || cp -r %q/. %q/", inner_dir, dest_path, inner_dir, dest_path))
+    else
+        -- No inner directory, just move everything
+        ensureDir(dest_path)
+        os.execute(string.format("cp -a %q/. %q/ 2>/dev/null || cp -r %q/. %q/", extract_dir, dest_path, extract_dir, dest_path))
+    end
+
+    -- Cleanup temp files
+    os.execute(string.format("rm -rf %q %q", tmp_zip, extract_dir))
+
+    return true, nil
 end
 
 return GithubBrowserAPI

@@ -201,5 +201,5 @@ githubbrowser.koplugin/
 ---
 
 **Author**: right9code
-**Version**: 2.1.0
+**Version**: 2.0.0
 **License**: [Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](https://creativecommons.org/licenses/by-nc/4.0/)

@@ -4,6 +4,7 @@ local IgnoreEngine = {}
 
 local DEFAULT_PATTERNS = {
     ".git",
+    ".ghbrowser.json",
     "*.sdr",
     ".koreader",
     "*.tmp",
